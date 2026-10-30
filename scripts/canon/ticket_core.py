@@ -165,6 +165,20 @@ ORCHESTRATED = "CANON_ORCHESTRATOR"
 PROD_COPY = "CANON_PROD_COPY"
 # Ответ оркестратора на запрос свежей копии прода (`ticket fresh`) — файл рядом с состоянием.
 FRESH_ANSWER = "fresh.json"
+# Своя сессия `session-run` (#452): случайная метка, которую `session-run` после своего старта
+# пишет в файл замка worktree (`SESSION_LOCK` личного каталога git) и передаёт `claude`
+# окружением. Совпали — `ticket start` внутри этой сессии подготовку не повторяет.
+SESSION_LOCK = "canon-session.lock"
+SESSION_MARK = "CANON_SESSION_MARK"
+
+
+def session_mark() -> str | None:
+    """Метка из файла замка этого worktree; файла нет или он пуст — None."""
+    lock = Path(git("rev-parse", "--path-format=absolute", "--git-dir")) / SESSION_LOCK
+    try:
+        return lock.read_text(encoding="utf-8").strip() or None
+    except OSError:
+        return None
 
 
 def orchestrated() -> bool:

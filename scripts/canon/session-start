@@ -138,7 +138,7 @@ QUEUED = "agent:queued"  # тикет в очереди оркестратора
 ORCHESTRATOR_STATE = "canon-orchestrator/state.json"  # своё состояние оркестратора
 RED = {"FAILURE", "ERROR", "TIMED_OUT", "CANCELLED", "ACTION_REQUIRED", "STARTUP_FAILURE"}
 # Замок сессии в личном каталоге git worktree: `session-run` держит его, пока идёт `claude`.
-SESSION_LOCK = "canon-session.lock"
+SESSION_LOCK = core.SESSION_LOCK
 SESSION_BRANCH = re.compile(r"^ticket-\d+(-.+)?$")
 PR_FIELDS = (
     "number,title,url,headRefName,headRefOid,baseRefName,isDraft,statusCheckRollup,"
@@ -243,11 +243,12 @@ def worktree_of(branch: str) -> Path | None:
 # --- замок сессии ---
 
 
-def take_lock(worktree: Path):
+def take_lock(worktree: Path, mark: str | None = None):
     """Замок сессии worktree — открытый файл под flock; None — его держит другой процесс.
 
     Файл — в личном каталоге git worktree. `session-run` держит замок, пока идёт `claude`;
-    снимается с концом процесса, в том числе аварийным. В файле — PID взявшего замок (#452).
+    снимается с концом процесса, в том числе аварийным. `mark` — метка своей сессии (#452,
+    `core.SESSION_MARK`): пишется в файл, пробы замка (`session_busy`) его не трогают.
     """
     git_dir = run("git", "-C", str(worktree), "rev-parse", "--path-format=absolute", "--git-dir")
     lock = open(Path(git_dir) / SESSION_LOCK, "a")  # noqa: SIM115 — держит вызывающий
@@ -256,11 +257,10 @@ def take_lock(worktree: Path):
     except BlockingIOError:
         lock.close()
         return None
-    # Кто держит (#452): `ticket start` внутри `claude` этого `session-run` узнаёт свою сессию по
-    # PID предка. Пишет только взявший замок, поэтому чужой PID в файле — не у живого держателя.
-    lock.truncate(0)
-    lock.write(str(os.getpid()))
-    lock.flush()
+    if mark is not None:
+        lock.truncate(0)
+        lock.write(mark)
+        lock.flush()
     return lock
 
 
