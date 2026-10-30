@@ -3,8 +3,9 @@
     scripts/canon/ticket start <N>
 
 Из любого чекаута проекта. Владелец запускает тикет одной командой и может отойти: вопросы
-копятся в тикете (`ticket ask`), работа кончается тем же `ticket ship`, что и в режиме
-`/implement N` с диалогом.
+копятся в тикете (`ticket ask`), работа кончается `ticket ship`. Это единственный вход в тикет
+(#452): прежний диалоговый вход набором скилла `/implement` упразднён, этот скилл Мэтта сессия
+выполняет по заданию.
 
 1. Подготовка — `session-start N` рядом со скриптом: уборка, PR автора первыми, тикет, worktree,
    метка `in-progress`. Тикет закрыт, занят или в нём текст посторонних (#196: тикет открыл не
@@ -17,6 +18,10 @@
    `ticket ship N`. Маршрут тикета уже идёт (шаг `ship` записан) или вопрос ждёт ответа —
    задание продолжить его. PR маршрута слит (тикет переоткрыт) — маршрут с нуля: прошлый — в
    архив рядом с состоянием, задание — `/implement N`.
+
+Внутри сессии тикета (`CANON_SESSION=ticket-N` на его ветке: её запустил `session-run` — из
+терминала владельца — признак `CANON_RUN_STARTED` — или оркестратором) `session-start` не
+зовётся: старт уже сделан, а его замок держит сама сессия (#452); вход в worktree не нужен.
 
 Под оркестратором (`CANON_ORCHESTRATOR=1`, #214) `session-start` PR автора не берёт; задание —
 то же `/implement N` с самопроверкой `/code-review`, конец — «код готов» или вопрос; у сессии пути
@@ -40,6 +45,8 @@ import argparse
 import json
 import os
 from pathlib import Path
+
+RUN_STARTED = "CANON_RUN_STARTED"  # `session-run` ставит своему `claude` (как `stop-check`)
 
 TASK = """Режим /start: владелец может быть не у экрана. Сделай тикет по скиллу
 `/implement {n}` (Мэтта: тикет, TDD, коммит) — с такими поправками:
@@ -87,6 +94,8 @@ def enter(plan: dict) -> str:
     ждёт и worktree вне `.claude/worktrees/` (`needs_click`), а поведение входа зависит от версии
     Claude Code (#105, прогон #142)."""
     wt = plan["worktree"]
+    if plan.get("inside"):  # сессия `session-run` уже запущена в worktree тикета
+        return f"Worktree — {wt} (ветка {plan['branch']}): сессия уже в нём, вход не нужен."
     line = f"Worktree — {wt} (ветка {plan['branch']}). Войди в него: EnterWorktree с path {wt}"
     if plan.get("needs_click"):
         line += " — вход может ждать клика владельца (worktree вне .claude/worktrees/)"
@@ -147,15 +156,21 @@ def main(argv: list[str], core) -> int:
 
 
 def own_session(core, n: int) -> dict | None:
-    """План без `session-start`: режим `/start` внутри сессии, которую оркестратор запустил или
-    возобновил `session-run` в worktree тикета, — старт он уже сделал; второй запуск повторил бы
-    уборку и `setup` проекта в worktree живой сессии (#214)."""
-    if not core.orchestrated() or os.environ.get("CANON_SESSION") != f"ticket-{n}":
+    """План без `session-start`: режим `/start` внутри сессии тикета, которую запустил или
+    возобновил `session-run` в worktree тикета (под оркестратором или из терминала владельца), —
+    старт он уже сделал; второй запуск повторил бы уборку и `setup` проекта в worktree живой
+    сессии (#214) и остановился бы на её собственном замке (#452). Вне оркестратора — только в
+    `claude`, запущенном `session-run` (он ставит ему `CANON_RUN_STARTED`): сессия по строке
+    «Запуск:» его не получает и идёт через `session-start` со всеми его проверками (тикет закрыт
+    или занят, текст посторонних, сессия уже идёт)."""
+    if os.environ.get("CANON_SESSION") != f"ticket-{n}":
         return None
     here = core.branch()
     if core.ticket_of(here) != n:
         return None
-    return {"kind": "ticket", "worktree": str(core.toplevel()), "branch": here}
+    if not core.orchestrated() and not os.environ.get(RUN_STARTED):
+        return None
+    return {"kind": "ticket", "worktree": str(core.toplevel()), "branch": here, "inside": True}
 
 
 def prepare(core, n: int):

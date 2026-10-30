@@ -13,6 +13,8 @@
 - открытый PR ветки с head = локальный HEAD, отметкой ревью (статус `review` = success) на head,
   без красного CI и с авто-мёржем, незакоммиченных правок отслеживаемых файлов нет — конец `/ship`;
 - слитый PR ветки с head = локальный HEAD, незакоммиченных правок нет;
+- у сессии тикета (`ticket-N`) — вопрос `ticket ask`, ждущий ответа (признаки — как под
+  оркестратором, ниже): с #452 ручной `session-run N --headless` тоже стартует с `/start N`;
 - отчёт об остановке **этой** сессии: метка `ready-for-human` и комментарий, первая строка
   которого — «Отчёт об остановке…» (так его пишет и `ship-finish --unconfirmed`), созданный после
   начала сессии (первая запись транскрипта), от участника репозитория, не скрытый. Где: открытый PR
@@ -217,6 +219,11 @@ class Session:
             if not c.get("isMinimized")
         )
 
+    def waiting_question(self, state: dict | None = None) -> bool:
+        """Вопрос `ticket ask` из состояния тикета ждёт ответа — законный конец сессии тикета."""
+        question = (self.ticket_state() if state is None else state).get("question")
+        return bool(question) and self.has_question(question)
+
     def orchestrated_problem(self, head: str, dirty: bool, prs: list[dict]) -> str | None:
         """Конец сессии под оркестратором: «код готов», вопрос, слитый PR, отчёт об остановке."""
         state = self.ticket_state()
@@ -225,7 +232,7 @@ class Session:
             return (
                 "код готов, но есть незакоммиченные правки отслеживаемых файлов" if dirty else None
             )
-        if (question := state.get("question")) and self.has_question(question):
+        if self.waiting_question(state):
             return None
         if any(p["state"] == "MERGED" and p["headRefOid"] == head for p in prs):
             return "PR слит, но есть незакоммиченные правки отслеживаемых файлов" if dirty else None
@@ -262,6 +269,10 @@ class Session:
             )
         if self.orchestrated:
             return self.orchestrated_problem(head, dirty, prs)
+        # Вопрос `ticket ask` — конец и при открытом PR (вопрос на шагах `ticket ship`), как под
+        # оркестратором (#452).
+        if self.kind == "ticket" and self.waiting_question():
+            return None
         pr = next((p for p in prs if p["state"] == "OPEN"), None)
         if pr is not None:
             return self.open_pr_problem(pr, head, dirty)
@@ -337,7 +348,17 @@ class Session:
             "(2) Если довести нельзя — отчёт об остановке этой сессии: комментарий, "
             "первая строка которого «Отчёт об остановке», дальше причина, доказательства, "
             f"варианты, рекомендация — понятно владельцу без сессии; плюс метка {WAITING}. "
-            f"Где: {where}."
+            f"Где: {where}.{self.ask_hint()}"
+        )
+
+    def ask_hint(self) -> str:
+        """Третий законный конец сессии тикета — вопрос владельцу (#452)."""
+        if self.kind != "ticket":
+            return ""
+        ask = self.core.command("ask", self.number)
+        return (
+            " (3) Сессия тикета: без ответа владельца тикет не сделать — вопрос, варианты и "
+            f"рекомендация в `.ticket/ask.md`, затем `{ask}`: вопрос, ждущий ответа, — тоже конец."
         )
 
 
