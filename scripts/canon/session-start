@@ -247,7 +247,7 @@ def take_lock(worktree: Path):
     """Замок сессии worktree — открытый файл под flock; None — его держит другой процесс.
 
     Файл — в личном каталоге git worktree. `session-run` держит замок, пока идёт `claude`;
-    снимается с концом процесса, в том числе аварийным.
+    снимается с концом процесса, в том числе аварийным. В файле — PID взявшего замок (#452).
     """
     git_dir = run("git", "-C", str(worktree), "rev-parse", "--path-format=absolute", "--git-dir")
     lock = open(Path(git_dir) / SESSION_LOCK, "a")  # noqa: SIM115 — держит вызывающий
@@ -256,6 +256,11 @@ def take_lock(worktree: Path):
     except BlockingIOError:
         lock.close()
         return None
+    # Кто держит (#452): `ticket start` внутри `claude` этого `session-run` узнаёт свою сессию по
+    # PID предка. Пишет только взявший замок, поэтому чужой PID в файле — не у живого держателя.
+    lock.truncate(0)
+    lock.write(str(os.getpid()))
+    lock.flush()
     return lock
 
 
@@ -1136,7 +1141,7 @@ def report(plan: dict, outside: bool) -> str:
         f"  сессия    CANON_SESSION={plan['session']}",
         f"  промпт    {plan['prompt']}",
         f"Запуск: cd {shlex.quote(plan['worktree'])} && CANON_SESSION={plan['session']} "
-        f"{core.STARTED}={plan['session']} claude -- {shlex.quote(plan['prompt'])}",
+        f"claude -- {shlex.quote(plan['prompt'])}",
     ]
     if outside:
         wt = shlex.quote(plan["worktree"])
@@ -1151,13 +1156,8 @@ def report(plan: dict, outside: bool) -> str:
         lines.append(
             f"Открытая сессия: войти в worktree — EnterWorktree с path {wt}{click_note}, дальше "
             "работа из него (вход не удался — стоп: владельцу одной строкой «нужен клик входа в "
-            "worktree тикета»); "
-            + (
-                f"промпт `{plan['prompt']}` — для новой сессии"
-                if plan["kind"] == "ticket"
-                else "промпт — задание по PR, его набирает владелец"
-            )
-            + "; «Запуск:» — для новой сессии из терминала, старт в ней не повторяется"
+            "worktree тикета»); промпт набирает владелец, «Запуск:» — для новой сессии из "
+            "терминала"
         )
     return "\n".join(lines)
 

@@ -13,8 +13,8 @@
 - открытый PR ветки с head = локальный HEAD, отметкой ревью (статус `review` = success) на head,
   без красного CI и с авто-мёржем, незакоммиченных правок отслеживаемых файлов нет — конец `/ship`;
 - слитый PR ветки с head = локальный HEAD, незакоммиченных правок нет;
-- у сессии тикета (`ticket-N`) — вопрос `ticket ask`, ждущий ответа (признаки — как под
-  оркестратором, ниже): с #452 ручной `session-run N --headless` тоже стартует с `/start N`;
+- у сессии тикета (`ticket-N`) без открытого PR — вопрос `ticket ask`, ждущий ответа (признаки —
+  как под оркестратором, ниже): с #452 ручной `session-run N --headless` тоже стартует с `/start N`;
 - отчёт об остановке **этой** сессии: метка `ready-for-human` и комментарий, первая строка
   которого — «Отчёт об остановке…» (так его пишет и `ship-finish --unconfirmed`), созданный после
   начала сессии (первая запись транскрипта), от участника репозитория, не скрытый. Где: открытый PR
@@ -270,19 +270,14 @@ class Session:
             )
         if self.orchestrated:
             return self.orchestrated_problem(head, dirty, prs)
-        # Вопрос `ticket ask` — конец и при открытом PR (вопрос на шагах `ticket ship`), как под
-        # оркестратором (#452).
-        if self.kind == "ticket" and self.waiting_question():
-            return (
-                "вопрос задан, но есть незакоммиченные правки отслеживаемых файлов"
-                if dirty
-                else None
-            )
         pr = next((p for p in prs if p["state"] == "OPEN"), None)
         if pr is not None:
             return self.open_pr_problem(pr, head, dirty)
         if any(p["state"] == "MERGED" and p["headRefOid"] == head for p in prs):
             return "PR слит, но есть незакоммиченные правки отслеживаемых файлов" if dirty else None
+        # Открытый PR доводят до конца: иначе следующий старт возьмёт его первым (#452).
+        if self.kind == "ticket" and self.waiting_question():
+            return None
         target = ("issue", self.number) if self.kind == "ticket" else ("pr", self.number)
         if self.has_report(*target):
             return None
@@ -364,7 +359,8 @@ class Session:
         ask = self.core.command("ask", self.number)
         return (
             " (3) Сессия тикета: без ответа владельца тикет не сделать — вопрос, варианты и "
-            f"рекомендация в `.ticket/ask.md`, затем `{ask}`: вопрос, ждущий ответа, — тоже конец."
+            f"рекомендация в `.ticket/ask.md`, затем `{ask}`: вопрос, ждущий ответа, без "
+            "открытого PR — тоже конец."
         )
 
 

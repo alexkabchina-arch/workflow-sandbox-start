@@ -165,10 +165,6 @@ ORCHESTRATED = "CANON_ORCHESTRATOR"
 PROD_COPY = "CANON_PROD_COPY"
 # Ответ оркестратора на запрос свежей копии прода (`ticket fresh`) — файл рядом с состоянием.
 FRESH_ANSWER = "fresh.json"
-# Старт сессии уже сделан (#452): метка сессии (`ticket-N`), которой `session-start` только что
-# подготовил worktree, — её ставит `session-run` своему `claude` (не на `--resume`) и строка
-# «Запуск:». По ней `ticket start` внутри такой сессии подготовку не повторяет.
-STARTED = "CANON_STARTED"
 
 
 def orchestrated() -> bool:
