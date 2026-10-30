@@ -1,0 +1,851 @@
+#!/usr/bin/env python3
+"""ship-finish — конец `/ship`: push, PR, отметка ревью на head, авто-мёрж.
+
+    scripts/canon/ship-finish --title <заголовок> --body-file <тело.md>
+        --review-report <отчёт.json> [--ready-for-human <строка>] [--weakening <решение>]
+    scripts/canon/ship-finish --pr-only --title … --body-file … --review-report … [флаги выше]
+    scripts/canon/ship-finish --mark --review-report <отчёт.json> [--ready-for-human …]
+        [--weakening …] [--hold]
+    scripts/canon/ship-finish --unconfirmed <отчёт>
+
+Из корня проекта, на ветке с закоммиченной работой. По порядку:
+
+0. Есть слитый PR ветки с head = локальный HEAD — «уже слит», код 0, больше ничего не делается
+   (отчёт ревью не нужен; `--unconfirmed` пишет отчёт и тогда). Так же, если GitHub слил PR по
+   ходу: ветки после push на сервере нет или открытого PR уже нет. Затем, до любой записи, —
+   сверка отчёта ревью.
+1. Проверка `secrets` блока `checks` профиля (`docs/agents/profile.md`, через `run-log`) — до
+   push, на каждом вызове с push (#258): работа без тикета шага маршрута не проходит. Красная —
+   отказ (код 2) с файлом и строкой находки gitleaks, без значения секрета, ничего не
+   отправлено; в профиле её нет — предупреждение, ветка уходит как раньше.
+   Затем местные ворота — только когда в профиле `origin/main` есть блок ```gates (сам воркфлоу
+   без CI, исключение 3б, #328; блок берётся не из ветки — ветка не снимет ворота сама себе): его
+   команды (`имя: команда`) и затронутые тесты — файлы `tests/test*.py`, упоминающие изменённый
+   файл ветки, а для изменённого модуля скриптов (`project/scripts/canon/*.py`) — и скрипты,
+   которые его упоминают; `test_session_start`, `test_ticket_start`, `test_stop_check` и
+   `test_review_guard` (старый путь) — только когда ветка меняет свой скрипт или сам тест (#376).
+   Каждая команда — под `run-log`, во временном worktree на проверяемом коммите
+   (неотслеживаемые файлы не участвуют); затронутые тесты — одним прогоном в машине Docker
+   Sandboxes, `scripts/vm-test run --commit <коммит> -- <файлы>` (#376), а где запускателя нет —
+   каждый своей командой `python3 -m unittest`. Хоть одно красное — отказ (код 3) со списком:
+   имя, код выхода и лог (у прогона в машине — и итог `run.py` с упавшими файлами); ничего не
+   отправлено, отметки нет. Машина занята — `vm-test --wait` ждёт в её очереди (#382) и
+   печатает место и примерное ожидание в лог ворот; предел — 30 минут без движения очереди
+   (`CANON_VM_BUSY_WAIT`), всего — 40 минут. Набора в машине не было (нет `sbx` или образа,
+   очередь стояла, сбой машины) и остальное зелёное — отказ
+   с кодом 1 и выходом: повторить или прогон на Mac, `CANON_TESTS_ON_MAC=1` перед той же
+   командой.
+   Зелёный коммит запоминается (`canon-gates-green` в каталоге git) — повтор ворот не гоняет.
+   Блока нет (проекты) — ворот нет. Те же ворота — и у `--mark` перед отметкой.
+   Затем `git push -u origin <HEAD>:refs/heads/<ветка>` — ровно проверенный коммит (без force) и
+   сверка: ветка на сервере — ровно локальный HEAD.
+2. PR ветки: нет открытого — `gh pr create`, есть — `gh pr edit` (тело и заголовок обновляются).
+   Были коммиты после ревью — в конец тела дописывается их список.
+3. `gh pr merge --auto --squash`, если авто-мёрж ещё не включён. Мёржа скрипт не ждёт.
+4. Отметка ревью — статус `review` = success на head-коммите (`gh api …/statuses/<sha>`);
+   уже стоит на этом коммите — не ставится второй раз. GitHub принимает статус только на коммит,
+   который уже на сервере, поэтому отметка — после push. Отметка — последней: обрыв до неё
+   оставляет PR без отметки, такой `session-start` подхватывает дозапуском `/ship`; PR с
+   отметкой без авто-мёржа — только если авто-мёрж выключили потом (владелец придержал PR).
+
+`--review-report` — один отчёт полного ревью `scripts/canon/review` (блок `canon_review`); отметка
+ставится только по нему, а не по слову сессии. Начало диффа (`base_sha`) — в `origin/main`, head
+отчёта — HEAD или его предок. Коммиты после head отчёта (исправления по находкам, тестам,
+`/verify`, возвратам) второго ревью не проходят — их проверяют тесты, CI и `/verify`; они видны в
+описании отметки (head отчёта и число коммитов) и списком в теле PR (решение канона
+`docs/decisions/2026-10-03-no-re-review.md`). Пропуск («только документы» или «чистая установка
+канона», #309) перепроверяется по файлам до самого HEAD правилом `review` (`needs_review`), ревью —
+по `modelUsage` на закреплённой модели. Нет
+отчёта, отчёт не один, начало не от `origin/main`, head не предок HEAD, head — код слитого PR ветки
+(его отчёт новой работы не видел; head слитого PR не получен — тоже отказ) — отказ (код 2).
+Перерасход вдвое (`ready_for_human` в отчёте) помечается и без флага.
+`--ready-for-human <строка>` — признак от ревью или `/verify` (перерасход вдвое): метка
+`ready-for-human` и комментарий со строкой, один раз на PR (повтор узнаётся по тексту, не по
+метке); отметка и авто-мёрж — как обычно.
+`--weakening <решение>` — решение сессии, когда ревью нашло ослабление проверок, прав агента,
+правил или обезличивания (`canon_review.weakening` не пуст или ответа нет): «запрошено тикетом:
+<цитата>», «убрано коммитом <sha>: …» (коммит сверяется: он среди коммитов после отчёта) или
+«ослабления нет: <почему>». Без него такой отчёт — отказ (код 2) до любой записи:
+ослабление, которого тикет не просит, — блокирующая находка (решение канона
+`docs/decisions/2026-10-08-no-restricted-paths.md`). Находка и решение — разделом
+«Ослабление защиты» в конце тела PR.
+Под оркестратором (#214) шаги делятся по правам. `--pr-only` — шаги 0–2 токеном сессии (push,
+PR, признак `--ready-for-human`): без авто-мёржа и отметки, этих прав у сессии нет. `--mark` —
+шаги 3–4 для оркестратора токеном App: без push, ветка на сервере должна быть ровно локальным
+HEAD, открытый PR ветки уже есть (черновик — снова готов к ревью); отчёт ревью и решение
+`--weakening` сверяются так же. `--mark --hold` — отметка без авто-мёржа (включённый — выключается):
+допуск пути v2 у тикета с флагом «миграция» ждёт «да» владельца (#346), затем `--mark` без него.
+Запуск — из worktree тикета (любого чекаута на ветке). Без флагов
+— все шаги, как в ручной сессии.
+`--unconfirmed <причина>` — отчёт об остановке: комментарий с первой строкой «Отчёт об остановке»
+(его ищет Stop-хук) и метка `ready-for-human`, без push и без отметки; пустая причина — отказ
+(код 2), отчёт не публикуется; незакоммиченные правки и
+слитый PR не мешают. Открытого PR нет — в тикете N ветки `ticket-N` (или `ticket-N-…`), PR не
+создаётся; есть — на PR, PR переводится в черновик, авто-мёрж выключается, а в тикет ветки —
+комментарий со ссылкой на отчёт (#295). Отчёт и ссылка кончаются упоминанием владельца
+(`@<первая часть owner/repo>`, как у оркестратора) — иначе пуша нет; уже упомянут — второй раз
+нет. Пишется при каждом вызове: Stop-хук засчитывает только отчёт этой сессии.
+
+Повторный запуск идемпотентен: второго PR нет, отметка только на итоговом коммите; после мёржа
+— «уже слит». Слитый PR со старым head работе не мешает: новые коммиты ветки идут новым PR, но с
+новым ревью — отчёт слитого PR их не покрывает. Код выхода 0 — готово; 1 — сбой push, `gh` или
+сверки; 2 — ошибка аргументов или состояния ветки (main, незакоммиченные правки, нет или не
+сходится отчёт ревью), до любой записи; 3 — красные местные ворота (чинит сессия).
+Файл вендорится из канона `alexkabchina-arch/workflow`: руками не править.
+Только стандартная библиотека Python 3.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import types
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+PROFILE = Path("docs/agents/profile.md")
+RUN_LOG_END = re.compile(r"^run-log: завершено с кодом \S+ · лог: (.+)$", re.M)
+GATES_BLOCK = re.compile(r"^```gates[ \t]*\n(.*?)^```", re.M | re.S)
+CANON_SCRIPTS = Path("project/scripts/canon")
+GATES_GREEN = "canon-gates-green"  # зелёные коммиты ворот, в каталоге git
+# Тесты старого пути (#376): в воротах — только когда ветка меняет свой скрипт (или сам тест);
+# перед тегом полный набор гоняет и их. Ослабление — по слову владельца 27.10.
+OLD_PATH = {
+    "tests/test_session_start.py": f"{CANON_SCRIPTS}/session-start",
+    "tests/test_ticket_start.py": f"{CANON_SCRIPTS}/ticket_start.py",
+    "tests/test_stop_check.py": f"{CANON_SCRIPTS}/stop-check",
+    "tests/test_review_guard.py": f"{CANON_SCRIPTS}/review-guard",
+}
+VM_TEST = Path("scripts/vm-test")  # запускатель машины тестов воркфлоу (#376)
+# Коды `vm-test`, при которых набора не было: ошибка запуска, занято, сбой машины.
+VM_NO_RUN = {
+    2: "машины нет (`sbx` или образ) — `scripts/vm-test image` или прогон на Mac: "
+    "`CANON_TESTS_ON_MAC=1` перед той же командой",
+    3: "машина тестов занята: очередь к ней не двигалась 30 минут или ждали дольше 40 — "
+    "повторить позже",
+    4: "сбой машины тестов — повторить; не проходит — прогон на Mac: `CANON_TESTS_ON_MAC=1`",
+    130: "прогон в машине прерван — повторить",
+}
+VM_BUSY_WAIT = 1800  # предел ожидания машины без движения её очереди, с (#382)
+CONTEXT = "review"
+TARGET = "origin/main"
+LABEL = "ready-for-human"
+REPORT_MARK = "Отчёт об остановке"
+# Ветки сессий тикета, как `SESSION_BRANCH` в `session-start`: `ticket-N` и `ticket-N-*`.
+TICKET_BRANCH = re.compile(r"^ticket-(\d+)(?:-.+)?$")
+PROTECTED = {"main", "master"}
+PR_FIELDS = "number,url,isDraft,labels,autoMergeRequest"
+DESCRIPTION = "ревью ошибок пройдено (/ship)"
+REMOVED_BY = re.compile(r"убрано коммитом\s+`?([0-9a-f]{7,40})\b", re.I)
+DESCRIPTION_SKIPPED = "ревью ошибок не нужно: только документы (/ship)"
+DESCRIPTION_INSTALL = "ревью ошибок не нужно: чистая установка канона (/ship)"
+
+
+class ShipError(Exception):
+    """Сбой push, gh или сверки (код выхода 1)."""
+
+
+class UsageError(Exception):
+    """Ошибка аргументов или состояния ветки (код выхода 2)."""
+
+
+class GatesRed(Exception):
+    """Красные местные ворота (код выхода 3): чинит сессия коммитом, не владелец."""
+
+
+class AlreadyMerged(Exception):
+    """PR с этим head уже слит (код выхода 0); аргумент — ссылка на PR."""
+
+
+def run(*cmd: str) -> str:
+    result = subprocess.run(cmd, capture_output=True, text=True, check=False)
+    if result.returncode != 0:
+        raise ShipError(f"{' '.join(cmd[:3])}: {(result.stderr or result.stdout).strip()}")
+    return result.stdout.strip()
+
+
+def check_branch(dirty_ok: bool = False) -> str:
+    try:
+        branch = run("git", "symbolic-ref", "--short", "HEAD")
+    except ShipError:
+        raise UsageError("HEAD не на ветке (detached)") from None
+    if branch in PROTECTED:
+        raise UsageError(f"ветка {branch}: /ship работает только из рабочей ветки")
+    if not dirty_ok and run("git", "status", "--porcelain", "--untracked-files=no"):
+        raise UsageError("есть незакоммиченные правки отслеживаемых файлов: сначала коммит")
+    return branch
+
+
+def load_canon(name: str):
+    """Модуль канона рядом со скриптом. Без правки `sys.path` и без `__pycache__` в
+    `scripts/canon/`."""
+    path = HERE / name
+    module = types.ModuleType(f"canon_{path.stem}")
+    module.__file__ = str(path)
+    exec(compile(path.read_text(encoding="utf-8"), str(path), "exec"), module.__dict__)
+    return module
+
+
+def load_canon_review():
+    """`review` рядом со скриптом — его `is_docs` и `MODEL`: пропуск перепроверяется тем же
+    правилом, что его выдал."""
+    return load_canon("review")
+
+
+def check_secrets() -> None:
+    """Проверка `secrets` блока `checks` профиля до push (#258) — та же, что шаг маршрута «тесты
+    и линтеры», через `run-log`: работа без тикета её шага не проходит. Красная — отказ (код 2)
+    с файлом и строкой находки, без значения секрета; в профиле её нет — предупреждение."""
+    core = load_canon("ticket_core.py")
+    root = Path(run("git", "rev-parse", "--show-toplevel"))
+    try:
+        text = (root / PROFILE).read_text(encoding="utf-8")
+    except OSError:
+        text = None
+    try:
+        argv = core.secrets_command(text, PROFILE)
+    except core.Failure as exc:
+        raise UsageError(f"{exc} — проверку `secrets` не разобрать, push и PR не сделаны") from None
+    if argv is None:
+        print(
+            f"ship-finish: предупреждение: в {PROFILE} нет проверки `secrets` — ветка уходит без "
+            "gitleaks, ключ поймает только CI после отправки",
+            file=sys.stderr,
+        )
+        return
+    argv = core.canon_secrets(argv, HERE)  # помощник — копия рядом, а не файл ветки (#283)
+    if Path(argv[0]).name != "run-log":
+        argv = [sys.executable, str(HERE / "run-log"), "-l", "secrets", "--", *argv]
+    res = subprocess.run(argv, cwd=root, capture_output=True, text=True, check=False)
+    if res.returncode == 0:
+        return
+    output = res.stdout + res.stderr
+    # Путь лога — из итоговой строки `run-log` (последней), а не из хвоста вывода команды.
+    log = next(reversed(RUN_LOG_END.findall(res.stdout)), None)
+    if log:  # находки — из полного лога, не из хвоста
+        try:
+            output = Path(log).read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            pass
+    where = f"; полный вывод — {log}" if log else ""
+    if found := core.secret_findings(output):
+        raise UsageError(
+            f"{core.leaks_line(found)} — push и PR не сделаны. Не чинить коммитом и не глушить: "
+            "ключ отзывает владелец (docs/secrets.md)" + where
+        )
+    raise UsageError(
+        f"проверка `secrets` профиля не прошла (код {res.returncode}), находок в выводе нет — "
+        "push и PR не сделаны" + where
+    )
+
+
+def parse_gates(text: str | None) -> list[tuple[str, list[str]]] | None:
+    """Команды блока ```gates профиля — тем же разбором, что ```checks (`ticket_core`):
+    `имя: команда`, без оболочки; блока нет — None."""
+    block = GATES_BLOCK.search(text) if text else None
+    if not block:
+        return None
+    core = load_canon("ticket_core.py")
+    try:
+        return core.parse_checks(f"```checks\n{block.group(1)}```\n", f"{PROFILE} (блок gates)")
+    except core.Failure as exc:
+        raise UsageError(str(exc)) from None
+    except ValueError as exc:  # shlex: незакрытая кавычка
+        raise UsageError(f"{PROFILE} (блок gates): строка не разобрана — {exc}") from None
+
+
+def affected_tests(root: Path, sha: str) -> list[str]:
+    """Затронутые тесты по правилу `CLAUDE.md` воркфлоу: `tests/test*.py`, упоминающие изменённый
+    файл ветки (`.py` — по имени без расширения), сами изменённые тесты, а для изменённого модуля
+    скриптов — ещё файлы, упоминающие скрипты, которые его грузят."""
+    span = f"{TARGET}...{sha}"
+    changed = [
+        Path(p)
+        for p in run("git", "diff", "--name-only", "--no-renames", "-z", span).split("\0")
+        if p
+    ]
+    names = {p.stem if p.suffix == ".py" else p.name for p in changed}
+    scripts = root / CANON_SCRIPTS
+    # Модуль скриптов — по имени, вложенный (`v2/roles.py`, #333) — путём без расширения: так его
+    # грузит скрипт (`load(…, "v2/roles.py")`), а одно имя `roles` нашлось бы где угодно.
+    modules = [
+        p.relative_to(CANON_SCRIPTS).with_suffix("").as_posix()
+        for p in changed
+        if p.is_relative_to(CANON_SCRIPTS) and p.suffix == ".py"
+    ]
+    if modules and scripts.is_dir():
+        for script in sorted(scripts.iterdir()):
+            if not script.is_file():
+                continue
+            text = script.read_text(encoding="utf-8", errors="replace")
+            if any(m in text for m in modules):
+                names.add(script.stem if script.suffix == ".py" else script.name)
+    chosen = []
+    for test in sorted((root / "tests").glob("test*.py")):
+        rel = test.relative_to(root)
+        if (own := OLD_PATH.get(rel.as_posix())) and not {rel, Path(own)} & set(changed):
+            continue  # старый путь — только при правке своего скрипта (#376)
+        text = test.read_text(encoding="utf-8", errors="replace")
+        if rel in changed or any(name in text for name in names):
+            chosen.append(rel.as_posix())
+    return chosen
+
+
+def vm_busy_wait() -> float:
+    """Сколько ждать очередь машины тестов без её движения: `CANON_VM_BUSY_WAIT` секунд
+    (тесты), иначе 30 мин."""
+    try:
+        return float(os.environ.get("CANON_VM_BUSY_WAIT", VM_BUSY_WAIT))
+    except ValueError:
+        return VM_BUSY_WAIT
+
+
+def suite_summary(log: Path) -> str | None:
+    """Итог `run.py` («… УПАЛИ: файлы») из лога прогона в машине."""
+    try:
+        lines = log.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return None
+    return next((x for x in reversed(lines) if x.startswith("run.py: тестов: ")), None)
+
+
+def check_gates(sha: str) -> None:
+    """Местные ворота воркфлоу без CI (исключение 3б, #328) перед push и отметкой: команды блока
+    ```gates профиля `origin/main` и затронутые тесты, каждый под `run-log`, во временном worktree
+    на `sha`. Красное — `GatesRed` со списком; блока нет — ничего (проекты)."""
+    try:
+        text = run("git", "show", f"{TARGET}:{PROFILE}")
+    except ShipError:
+        return
+    gates = parse_gates(text)
+    if gates is None:
+        return
+    common = Path(run("git", "rev-parse", "--path-format=absolute", "--git-common-dir"))
+    seen = common / GATES_GREEN
+    try:
+        green = seen.read_text(encoding="utf-8").split()
+    except OSError:
+        green = []
+    if sha in green:
+        print(f"ship-finish: местные ворота на {sha[:7]} уже зелёные", flush=True)
+        return
+    tmp = Path(tempfile.mkdtemp(prefix="ship-finish-gates-"))
+    tree = tmp / "tree"
+    failed, no_run = [], None
+    try:
+        run("git", "worktree", "add", "-q", "--detach", str(tree), sha)
+        tests = affected_tests(tree, sha)
+        vm = None
+        if tests and (tree / VM_TEST).is_file():
+            # Затронутые тесты — одним прогоном в машине (#376), а не по файлу на Mac.
+            vm = f"тесты в машине ({len(tests)})"
+            # Машина занята — `vm-test` ждёт в её очереди сам и печатает место (#382).
+            queue = ["--wait", f"{vm_busy_wait():g}"]
+            gates.append(
+                (vm, [sys.executable, str(VM_TEST), "run", "--commit", sha, *queue, "--", *tests])
+            )
+        else:
+            gates += [(test, [sys.executable, "-m", "unittest", test]) for test in tests]
+        for name, argv in gates:
+            print(f"ship-finish: ворота — {name}", flush=True)
+            label = re.sub(r"[^A-Za-z0-9._-]+", "-", name).strip("-") or "gate"
+            label = "vm-test" if name == vm else label
+            cmd = [sys.executable, str(HERE / "run-log"), "-n", "0", "-l", label, "--", *argv]
+            res = subprocess.run(cmd, cwd=tree, capture_output=True, text=True, check=False)
+            if res.returncode != 0:
+                log = next(reversed(RUN_LOG_END.findall(res.stdout)), None)
+                failed.append(f"{name} (код {res.returncode}" + (f", лог {log})" if log else ")"))
+                if name == vm and res.returncode in VM_NO_RUN:
+                    no_run = f"{failed[-1]}: {VM_NO_RUN[res.returncode]}"
+                elif name == vm and log and (fell := suite_summary(Path(log))):
+                    failed[-1] += f": {fell}"  # какие файлы упали — сразу в задании сессии
+    finally:
+        git_ok("worktree", "remove", "--force", str(tree))
+        shutil.rmtree(tmp, ignore_errors=True)
+    # Набора не было — это не красные тесты; но красные соседи (ruff, формат) — чинит сессия.
+    if no_run and len(failed) == 1:
+        raise ShipError(
+            f"местные ворота не прошли: {'; '.join([*failed[:-1], no_run])} — push и PR не "
+            "сделаны, отметки нет"
+        )
+    if failed:
+        failed = [no_run if no_run and x == failed[-1] else x for x in failed]
+        raise GatesRed(
+            f"местные ворота не прошли: {'; '.join(failed)} — push и PR не сделаны, отметки нет; "
+            "починить коммитом и вызвать снова"
+        )
+    with seen.open("a", encoding="utf-8") as out:
+        out.write(sha + "\n")
+    print(f"ship-finish: местные ворота зелёные ({len(gates)})", flush=True)
+
+
+def load_review(path: str) -> dict:
+    """Отчёт `review` целиком; блок `canon_review` с `base_sha` и `head` обязателен."""
+    try:
+        data = json.loads(Path(path).read_text(encoding="utf-8"))
+    except OSError as exc:
+        raise UsageError(f"отчёт ревью {path} не прочитан: {exc.strerror}") from None
+    except ValueError:  # не JSON или не UTF-8
+        raise UsageError(f"отчёт ревью {path}: не JSON в UTF-8") from None
+    verdict = data.get("canon_review") if isinstance(data, dict) else None
+    fields = ("base_sha", "head")
+    if not isinstance(verdict, dict) or not all(isinstance(verdict.get(f), str) for f in fields):
+        raise UsageError(
+            f"отчёт ревью {path}: нет canon_review с base_sha и head — это не отчёт "
+            "scripts/canon/review (или он старше #61): запустить ревью заново"
+        )
+    return data
+
+
+def git_ok(*args: str) -> bool:
+    return subprocess.run(["git", *args], capture_output=True, check=False).returncode == 0
+
+
+def is_ancestor(older: str, newer: str) -> bool:
+    return git_ok("merge-base", "--is-ancestor", older, newer)
+
+
+def check_report(path: str, data: dict, sha: str, canon) -> None:
+    """Отчёт — след прогона: пропуск — правда только документы (до самого HEAD: коммиты после
+    отчёта ревью не проходят), ревью — на закреплённой модели."""
+    verdict = data["canon_review"]
+    if verdict.get("skipped") is True:
+        span = f"{TARGET}...{sha}"  # как дифф `review`: слитый в ветку main — не её код
+        files = [
+            p
+            for p in run("git", "diff", "--name-only", "--no-renames", "-z", span).split("\0")
+            if p
+        ]
+        # То же правило, что выдало пропуск: документы и чистая установка канона (#309).
+        code, _, note = canon.needs_review(files, run("git", "merge-base", TARGET, sha), sha)
+        if code:
+            why = f" (чистая установка не подтверждена: {note})" if note else ""
+            raise UsageError(
+                f"отчёт ревью {path} — пропуск ревью, а в ветке есть код: "
+                f"{', '.join(code[:5])}{why} — запустить ревью заново"
+            )
+    elif canon.MODEL not in (data.get("modelUsage") or {}):
+        raise UsageError(
+            f"отчёт ревью {path}: нет прогона на {canon.MODEL} (modelUsage) — "
+            "запустить ревью заново"
+        )
+
+
+def check_review(paths: list[str], sha: str, merged: list[dict]) -> dict:
+    """Один отчёт полного ревью: от `origin/main`, head — `sha` или его предок, но не коммит
+    слитого PR ветки (`merged`): его отчёт новой работы не видел.
+
+    Возвращает блок `canon_review` отчёта."""
+    if not paths:
+        raise UsageError(
+            "нет --review-report: отметка ревью ставится только по отчёту scripts/canon/review"
+        )
+    if len(paths) > 1:
+        raise UsageError(
+            f"отчётов ревью {len(paths)}, а нужен один отчёт полного ревью ветки: прицельного "
+            "ревью нет, коммиты после ревью проверяют тесты, CI и /verify"
+        )
+    path = paths[0]
+    report = load_review(path)
+    if not git_ok("rev-parse", "--verify", "-q", TARGET):
+        raise UsageError(f"нет {TARGET}: не с чем сверить начало ревью (git fetch)")
+    review = report["canon_review"]
+    if not is_ancestor(review["base_sha"], TARGET):
+        raise UsageError(
+            f"отчёт ({path}) ревьюит не всю ветку: начало диффа {review['base_sha'][:7]} не в "
+            f"{TARGET} — ревью запускается от {TARGET}"
+        )
+    if not is_ancestor(review["head"], sha):
+        raise UsageError(
+            f"отчёт ревью ({path}) по head {review['head'][:7]}, а он не предок HEAD {sha[:7]}: "
+            f"ветка переписана или отчёт чужой — ревью заново от {TARGET}"
+        )
+    for pr in merged:
+        if pr.get("headRefOid"):
+            fetch_head(pr)
+        if pr.get("headRefOid") and is_ancestor(review["head"], pr["headRefOid"]):
+            raise UsageError(
+                f"отчёт ревью ({path}) — по коду уже слитого PR {pr['url']}: новые коммиты он "
+                "не видел — ревью заново"
+            )
+    check_report(path, report, sha, load_canon_review())
+    return review
+
+
+def fetch_head(pr: dict) -> None:
+    """head слитого PR — локально (`pull/<N>/head` с сервера, если его нет): иначе сверка
+    «отчёт не его» молча проходит — `merge-base` на отсутствующем коммите падает."""
+    sha = pr["headRefOid"]
+    if git_ok("cat-file", "-e", f"{sha}^{{commit}}"):
+        return
+    git_ok("fetch", "-q", "origin", f"pull/{pr.get('number')}/head")
+    if not git_ok("cat-file", "-e", f"{sha}^{{commit}}"):
+        raise UsageError(
+            f"head {sha[:7]} слитого PR {pr['url']} не получен (git fetch): не проверить, что "
+            "отчёт ревью не по его коду"
+        )
+
+
+def unreviewed_commits(review: dict, sha: str) -> list[tuple[str, str]]:
+    """Коммиты ветки после head отчёта до `sha`, старые первыми: (короткий sha, тема). Коммиты
+    `origin/main`, слитые в ветку, — не её работа и не в счёт; коммит слияния — в счёт."""
+    cmd = ["git", "log", "--reverse", "--format=%h%x00%s", sha, "--not", review["head"], TARGET]
+    return [tuple(line.split("\0", 1)) for line in run(*cmd).splitlines()]
+
+
+def read_body(body_file: str) -> str:
+    try:
+        return Path(body_file).read_text(encoding="utf-8")
+    except OSError as exc:
+        raise UsageError(f"тело PR {body_file} не прочитано: {exc.strerror}") from None
+    except UnicodeDecodeError:
+        raise UsageError(f"тело PR {body_file}: не UTF-8") from None
+
+
+def weakening_section(
+    review: dict, decision: str | None, unreviewed: list[tuple[str, str]], canon
+) -> str:
+    """Проверяет решение сессии по ослаблению защиты и возвращает раздел тела PR о нём;
+    ослабления нет — пустая строка.
+
+    Ревью нашло ослабление проверок, прав агента, правил или обезличивания (или не ответило на
+    вопрос) — без решения `--weakening` отказ: такая находка блокирующая. «Убрано коммитом
+    <sha>» сверяется: коммит — среди коммитов ветки после отчёта (`unreviewed`).
+    """
+    if review.get("skipped") is True:
+        return ""
+    found = review.get("weakening")
+    if not isinstance(found, str):
+        found = canon.NO_WEAKENING_ANSWER
+    found = found.strip()
+    if not found:
+        return ""
+    decision = (decision or "").strip()
+    if not decision:
+        raise UsageError(
+            f"ревью: ослабление защиты — {found}. Блокирующая находка: тикет его не просит — "
+            "убрать в ветке или отчёт об остановке. Решение — в --weakening: "
+            '"запрошено тикетом: <цитата>", "убрано коммитом <sha>: …" или '
+            '"ослабления нет: <почему>"'
+        )
+    if match := REMOVED_BY.match(decision):
+        given = match.group(1)
+        after = [run("git", "rev-parse", short) for short, _ in unreviewed]
+        if not any(full.startswith(given) for full in after):
+            raise UsageError(
+                f"--weakening: коммита {given} нет среди коммитов ветки после отчёта ревью — "
+                "назовите коммит, который убрал ослабление"
+            )
+    return f"\n\n## Ослабление защиты\n\nРевью: {found}\n\nРешение сессии: {decision}"
+
+
+def pr_body(
+    body_file: str, review: dict, unreviewed: list[tuple[str, str]], weakening: str = ""
+) -> str:
+    """Тело PR: раздел об ослаблении защиты и список коммитов после ревью в конце; без них —
+    исходный файл."""
+    body = read_body(body_file)
+    if not unreviewed and not weakening:
+        return body_file
+    tail = weakening
+    if unreviewed:
+        lines = "\n".join(f"- `{short}` {subject}" for short, subject in unreviewed)
+        tail += (
+            f"\n\n## Коммиты после ревью\n\nОтчёт ревью — по `{review['head'][:7]}`; коммиты "
+            "после него ревью не проходили, их проверяют тесты, CI и `/verify` "
+            f"(`ship-finish`):\n\n{lines}\n"
+        )
+    with tempfile.NamedTemporaryFile(
+        "w", encoding="utf-8", suffix=".md", prefix="ship-finish-", delete=False
+    ) as out:
+        out.write(body.rstrip("\n") + tail.rstrip("\n") + "\n")
+    return out.name
+
+
+def human_lines(given: str | None, review: dict) -> str | None:
+    """Признак ready-for-human: строка сессии плюс перерасход вдвое из самого отчёта."""
+    lines = [given] if given else []
+    warning = review.get("warning")
+    if review.get("ready_for_human") is True and warning and warning not in (given or ""):
+        lines.append(warning)
+    return "; ".join(lines) or None
+
+
+def check_merged(branch: str, sha: str) -> list[dict]:
+    """Слитый PR ветки с head = `sha` — повтор после авто-мёржа: делать нечего. Иначе — слитые
+    PR ветки (`number`, `url`, `headRefOid`)."""
+    cmd = f"gh pr list --head {branch} --state merged --json number,url,headRefOid"
+    found = json.loads(run(*cmd.split()))
+    merged = next((p for p in found if p.get("headRefOid") == sha), None)
+    if merged:
+        raise AlreadyMerged(merged["url"])
+    return found
+
+
+def push(branch: str, sha: str) -> None:
+    try:  # ровно проверенный коммит `sha`, а не HEAD на момент push (#258)
+        run("git", "push", "-u", "origin", f"{sha}:refs/heads/{branch}")
+    except ShipError as exc:
+        raise ShipError(f"push отклонён: {exc}") from None
+    remote = run("git", "ls-remote", "origin", f"refs/heads/{branch}").split("\t")[0]
+    if remote != sha:
+        if not remote:
+            check_merged(branch, sha)
+        raise ShipError(f"после push ветка на сервере {remote[:7] or 'нет'}, локально {sha[:7]}")
+
+
+def find_pr(branch: str) -> dict | None:
+    found = json.loads(run(*f"gh pr list --head {branch} --state open --json {PR_FIELDS}".split()))
+    return found[0] if found else None
+
+
+def undraft(branch: str) -> None:
+    """Черновик PR ветки (отчёт об остановке, догон основы) — снять до push: CI проекта
+    пропускает задачи на черновике (контракт CI, #336), а пропущенная задача для GitHub — успех;
+    снятый после push черновик оставил бы на новом head пропущенную обязательную проверку, и
+    отметка сразу за ним слила бы PR раньше полного прогона. Push в PR не черновиком идёт полным.
+    Авто-мёрж черновика (догон: старый head с отметкой) выключается до снятия: иначе старый
+    head слился бы до push; включает его снова финиш (или `--mark` оркестратора)."""
+    pr = find_pr(branch)
+    if pr is not None and pr["isDraft"]:
+        number = str(pr["number"])
+        if pr.get("autoMergeRequest"):
+            run("gh", "pr", "merge", number, "--disable-auto")
+        run("gh", "pr", "ready", number)
+
+
+def upsert_pr(branch: str, sha: str, title: str, body_file: str) -> dict:
+    pr = find_pr(branch)
+    if pr is None:
+        check_merged(branch, sha)
+        run("gh", "pr", "create", "--head", branch, "--title", title, "--body-file", body_file)
+        pr = find_pr(branch)
+        if pr is None:
+            raise ShipError(f"PR ветки {branch} создан, но не найден")
+        return pr
+    number = str(pr["number"])
+    run("gh", "pr", "edit", number, "--title", title, "--body-file", body_file)
+    if pr["isDraft"]:
+        run("gh", "pr", "ready", number)
+    return pr
+
+
+def flag_for_human(number: str, text: str) -> None:
+    """Метка ready-for-human и комментарий `text` на PR — один раз.
+
+    Повтор узнаётся по тексту комментария, а не по метке: метка от другого признака (отчёт об
+    остановке) не должна глушить новый, а снятую владельцем метку повтор не возвращает.
+    """
+    item = json.loads(run("gh", "pr", "view", number, "--json", "labels,comments"))
+    if any((c.get("body") or "").strip() == text.strip() for c in item.get("comments") or []):
+        return
+    if not any(label["name"] == LABEL for label in item.get("labels") or []):
+        run("gh", "pr", "edit", number, "--add-label", LABEL)
+    run("gh", "pr", "comment", number, "--body", text)
+
+
+def report_stop(branch: str, reason: str) -> str:
+    """Отчёт об остановке без push, при каждом вызове (его ищет Stop-хук — отчёт этой сессии):
+    на открытом PR (PR — в черновик, авто-мёрж выключен) или в тикете ветки `ticket-N`
+    (`ticket-N-…`). Возвращает, где он."""
+    # Причина — хоть одна буква или цифра после метки: «Отчёт об остановке: …» из шаблона — не она.
+    given = reason.strip()
+    if given.lower().startswith(REPORT_MARK.lower()):
+        given = given[len(REPORT_MARK) :]
+    if not re.search(r"\w", given):
+        raise UsageError(
+            "--unconfirmed без причины: владелец не узнает, что остановило — назовите причину "
+            '(--unconfirmed "критерий 2 не подтверждён: …")'
+        )
+    text = reason if reason.lstrip().startswith(REPORT_MARK) else f"{REPORT_MARK}: {reason}"
+    # Упоминание — пуш владельцу (#295): владелец берётся, как у оркестратора и `ticket ask`.
+    # Не узнали — отчёт без упоминания: отчёт важнее пуша.
+    try:
+        owner = run("gh", "repo", "view", "--json", "owner", "-q", ".owner.login")
+    except ShipError as exc:
+        print(f"ship-finish: отчёт без упоминания владельца — {exc}", file=sys.stderr)
+        owner = ""
+    text = with_mention(text, owner)
+    match = TICKET_BRANCH.match(branch)
+    pr = find_pr(branch)
+    if pr is None:
+        if not match:
+            raise UsageError(
+                f"ветка {branch}: открытого PR нет, а тикет для отчёта берётся из имени ветки "
+                "ticket-N или ticket-N-… — отчёт вручную: gh issue comment и gh issue edit "
+                f"--add-label {LABEL}"
+            )
+        kind, number, where = "issue", match.group(1), f"тикет #{match.group(1)}"
+    else:
+        kind, number = "pr", str(pr["number"])
+        where = f"{pr['url']} (черновик, авто-мёрж выключен)"
+        if pr.get("autoMergeRequest"):
+            run("gh", "pr", "merge", number, "--disable-auto")
+        if not pr["isDraft"]:
+            run("gh", "pr", "ready", number, "--undo")
+    labels = json.loads(run("gh", kind, "view", number, "--json", "labels")).get("labels") or []
+    if not any(label["name"] == LABEL for label in labels):
+        run("gh", kind, "edit", number, "--add-label", LABEL)
+    posted = run("gh", kind, "comment", number, "--body", text)
+    if kind == "pr" and match:
+        # PR открыт App — владелец там не автор: в тикете ссылка с упоминанием (#295). Первая
+        # строка — отметка отчёта: ответ владельца в тикете маршрут ищет после неё. Парная
+        # копия — запасной путь `publish_stop` в `ticket_ship.py`.
+        url = posted if posted.startswith("https://") else pr["url"]
+        link = f"{REPORT_MARK} — на PR: {url}"
+        body = with_mention(link, owner, f"отчёт и метка `{LABEL}` — на PR")
+        try:  # отчёт уже на PR: сбой ссылки — не сбой отчёта, повтор задвоил бы его
+            run("gh", "issue", "comment", match.group(1), "--body", body)
+        except ShipError as exc:
+            print(f"ship-finish: ссылка на отчёт в тикете не легла — {exc}", file=sys.stderr)
+    return where
+
+
+def with_mention(text: str, owner: str, need: str = f"метка `{LABEL}`") -> str:
+    """Текст с упоминанием владельца в конце (`need` — что его ждёт); владелец не известен или
+    уже упомянут — как есть. Парная копия — в `ticket_ship.py`."""
+    mentioned = re.compile(rf"(?<![\w@.-])@{re.escape(owner)}(?![\w-])", re.I)
+    if not owner or mentioned.search(text):
+        return text
+    return f"{text.rstrip()}\n\n@{owner}, нужен человек: {need}."
+
+
+def check_pushed(branch: str, sha: str) -> None:
+    """`--mark` без push: на сервере — ровно локальный HEAD, отметка ляжет на проверенный код."""
+    remote = run("git", "ls-remote", "origin", f"refs/heads/{branch}").split("\t")[0]
+    if remote != sha:
+        raise UsageError(
+            f"ветка {branch} на сервере {remote[:7] or 'нет'}, локально {sha[:7]}: отметка — "
+            "только на запушенный head (push и PR — `--pr-only` сессии)"
+        )
+
+
+def mark_review(sha: str, description: str) -> bool:
+    """Ставит отметку ревью на коммит; False — она там уже стоит."""
+    statuses = json.loads(run("gh", "api", f"repos/{{owner}}/{{repo}}/commits/{sha}/statuses"))
+    latest = next((s for s in statuses if s.get("context") == CONTEXT), None)
+    if latest and latest.get("state") == "success":
+        return False
+    fields = ["state=success", f"context={CONTEXT}", f"description={description}"]
+    post = ["gh", "api", "-X", "POST", f"repos/{{owner}}/{{repo}}/statuses/{sha}"]
+    run(*post, *(arg for field in fields for arg in ("-f", field)))
+    return True
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(prog="ship-finish", description=__doc__.split("\n\n")[0])
+    parser.add_argument("--title", help="заголовок PR (кроме --unconfirmed)")
+    parser.add_argument("--body-file", help="файл тела PR (кроме --unconfirmed)")
+    parser.add_argument(
+        "--review-report",
+        action="append",
+        default=[],
+        metavar="ОТЧЁТ",
+        help="отчёт полного ревью scripts/canon/review (один)",
+    )
+    parser.add_argument(
+        "--ready-for-human", metavar="СТРОКА", help="признак от ревью для владельца"
+    )
+    parser.add_argument(
+        "--weakening",
+        metavar="РЕШЕНИЕ",
+        help="решение сессии по ослаблению защиты из отчёта ревью: запрошено тикетом или убрано",
+    )
+    parser.add_argument(
+        "--unconfirmed", metavar="ПРИЧИНА", help="отчёт об остановке: без push, в тикет или на PR"
+    )
+    split = parser.add_mutually_exclusive_group()
+    split.add_argument(
+        "--pr-only", action="store_true", help="push и PR без авто-мёржа и отметки (сессия)"
+    )
+    split.add_argument(
+        "--mark", action="store_true", help="авто-мёрж и отметка без push (оркестратор)"
+    )
+    parser.add_argument(
+        "--hold", action="store_true", help="с --mark: отметка без авто-мёржа (ждёт «да»)"
+    )
+    args = parser.parse_args(argv)
+    if args.unconfirmed is not None and (args.pr_only or args.mark):
+        parser.error("--unconfirmed не сочетается с --pr-only и --mark")
+    if args.hold and not args.mark:
+        parser.error("--hold — только с --mark")
+    try:
+        branch = check_branch(dirty_ok=args.unconfirmed is not None or args.mark)
+        if args.unconfirmed is not None:  # и после мёржа: правки в дереве — тоже остановка
+            where = report_stop(branch, args.unconfirmed)
+            print(f"ship-finish: отчёт об остановке — {where}, ждёт владельца ({LABEL}), без push")
+            return 0
+        sha = run("git", "rev-parse", "HEAD")
+        merged = check_merged(branch, sha)
+        if not args.mark and (not args.title or not args.body_file):
+            raise UsageError("нужны --title и --body-file (без них — только --unconfirmed)")
+        review = check_review(args.review_report, sha, merged)
+        unreviewed = unreviewed_commits(review, sha)
+        weakening = weakening_section(review, args.weakening, unreviewed, load_canon_review())
+        if args.mark:
+            check_pushed(branch, sha)
+            check_gates(sha)
+            pr = find_pr(branch)
+            if pr is None:
+                raise UsageError(f"у ветки {branch} нет открытого PR: сначала `--pr-only`")
+            if pr["isDraft"]:  # черновик отчёта об остановке не сольётся и с авто-мёржем
+                run("gh", "pr", "ready", str(pr["number"]))
+        else:
+            check_secrets()
+            check_gates(sha)
+            body_file = pr_body(args.body_file, review, unreviewed, weakening)
+            try:
+                undraft(branch)
+                push(branch, sha)
+                pr = upsert_pr(branch, sha, args.title, body_file)
+            finally:
+                if body_file != args.body_file:
+                    Path(body_file).unlink(missing_ok=True)
+        number = str(pr["number"])
+        if human := human_lines(args.ready_for_human, review):
+            flag_for_human(number, f"{LABEL}: {human}")
+        if args.pr_only:
+            print(
+                f"ship-finish: {pr['url']} — push и PR на {sha[:7]}; авто-мёрж и отметку ревью "
+                "ставит оркестратор (--mark)"
+            )
+            return 0
+        if args.hold:  # «миграция» (#346): авто-мёрж — только после «да» владельца
+            if pr.get("autoMergeRequest"):
+                run("gh", "pr", "merge", number, "--disable-auto")
+        elif not pr.get("autoMergeRequest"):
+            run("gh", "pr", "merge", number, "--auto", "--squash")
+        description = DESCRIPTION
+        if review.get("skipped") is True:
+            description = DESCRIPTION_INSTALL if review.get("install") else DESCRIPTION_SKIPPED
+        if unreviewed:
+            description += (
+                f"; отчёт по {review['head'][:7]}, коммитов после ревью: {len(unreviewed)}"
+            )
+        marked = mark_review(sha, description)
+    except AlreadyMerged as exc:
+        print(f"ship-finish: уже слит: {exc}")
+        return 0
+    except UsageError as exc:
+        print(f"ship-finish: {exc}", file=sys.stderr)
+        return 2
+    except GatesRed as exc:
+        print(f"ship-finish: {exc}", file=sys.stderr)
+        return 3
+    except ShipError as exc:
+        print(f"ship-finish: {exc}", file=sys.stderr)
+        return 1
+    mark = "поставлена" if marked else "уже стояла"
+    auto = "авто-мёрж выключен — ждёт «да» владельца" if args.hold else "авто-мёрж включён"
+    print(f"ship-finish: {pr['url']} — отметка ревью на {sha[:7]} {mark}, {auto}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

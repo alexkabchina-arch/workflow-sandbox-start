@@ -1,0 +1,912 @@
+#!/usr/bin/env python3
+"""sandbox — изолированная среда сессий оркестратора: одна Docker Sandbox на проект (#223).
+
+    <копия канона>/project/scripts/canon/sandbox up [--memory 4g]   # поднять песочницу проекта
+    <копия канона>/project/scripts/canon/sandbox check [--probe ХОСТ:ПОРТ]  # проверить изоляцию
+    <копия канона>/project/scripts/canon/sandbox login              # вход Claude внутри (один раз)
+    <копия канона>/project/scripts/canon/sandbox status
+    <копия канона>/project/scripts/canon/sandbox exec [--] КОМАНДА…  # команда в клоне внутри
+    <копия канона>/project/scripts/canon/sandbox load-image ОБРАЗ…  # образ с хоста — внутрь
+    <копия канона>/project/scripts/canon/sandbox stop|rm
+
+Среда выбрана разведкой #210 (`docs/decisions/2026-10-17-orchestrator-isolation.md`); команду
+`docker sandbox` из разведки Docker убрал, среда — на её замене, CLI `sbx` (Docker Sandboxes,
+`brew install docker/tap/sbx`, вход — `sbx login`). Запуск — из главного чекаута проекта, скрипт —
+из своей копии канона, как у оркестратора: из проекта или его worktree — отказ (код 2).
+
+`up` — одной командой, повторно — та же песочница:
+
+- **настройки `sbx`**: проброс SSH-агента владельца в песочницы выключен
+  (`ssh.agentForwardingEnabled`); общая политика сети — «запрещено всё» (`policy init deny-all`,
+  если её ещё нет); общая политика, которая что-то пускает всем песочницам, или общий ключ в
+  `sbx secret`, кроме входа Claude `anthropic` (ключ GitHub владельца ушёл бы во все песочницы),
+  — отказ (код 1);
+- **клон проекта** — `~/.canon/sandbox/<проект>-<хеш пути>/clone`, `git clone` адреса `origin`
+  главного чекаута: без `.env` и прочих неотслеживаемых файлов владельца; главный чекаут в
+  песочницу не монтируется. Существующий клон скрипт не трогает и git в нём не выполняет: его
+  правят сессии, и хук, заложенный ими, сработал бы на хосте;
+- **песочница** `canon-<проект>-<хеш>` (`sbx create … claude <клон> <копия канона>/project:ro`):
+  клон — на запись, скрипты копии канона — только на чтение; память — `--memory` или
+  `git config canon.sandboxMemory` (иначе по умолчанию `sbx` — половина памяти Mac). Песочница
+  смонтирована иначе — отказ: `rm` и снова `up`;
+- **gitleaks внутри** (#283) — версии, закреплённой в каноне (`GITLEAKS_VERSION`; на Mac нужна
+  та же): проверка `secrets` шага маршрута идёт внутри. Архив релиза linux под архитектуру
+  песочницы качает Mac с GitHub и сверяет контрольную сумму (`GITLEAKS_SHA256`), файл `gitleaks`
+  из архива — в кэш `~/.canon/tools/`, внутрь — потоком через `sbx exec -i` в `/usr/local/bin`;
+  сети песочнице не нужно. Нужная версия внутри уже есть — ничего не качается; на Mac другая
+  версия или gitleaks нет — строка об этом;
+- **браузер для `/verify`** (#292) — образ Playwright версии pin проекта: его имя печатает
+  команда проекта `git config canon.sandboxBrowser` (в главном чекауте); нет на Mac — `docker
+  pull`, внутри другого id или нет — как `load-image`. Ключа нет или сбой — строка, не сбой;
+- **сеть песочницы** — поверх общего запрета разрешены домены GitHub, pypi, npm и Docker Hub
+  (`HOSTS`) и `git config canon.sandboxHosts` (через запятую); домены Anthropic даёт сам `sbx`.
+  Разрешённое сверх списка (убрано из настройки, добавлено руками) `up` снимает. Память,
+  заданная для уже созданной песочницы, не применяется — строка об этом.
+
+`check` — проверка изоляции изнутри песочницы (Python внутри) и снаружи; каждая строка ✅ или ❌,
+хоть один ❌ — код 1: нет `~/.ssh`, связки ключей (`security`); в домашней папке владельца на
+каждом уровне — только следующий каталог цепочки к смонтированным папкам; ни один
+неотслеживаемый `.env` главного чекаута не виден по своему пути, а копии в клоне нет (хеши
+сверяет хост: в команду пробы они не идут); в окружении нет ключей, кроме заглушек прокси `sbx`;
+в SSH-агенте нет ключей; токен входа Claude внутри — заглушка прокси, а не настоящий; копия
+канона — только на чтение; домен вне списка закрыт; прямой TCP к хосту Mac
+(`host.docker.internal:22`), к целям `git config canon.sandboxProbe` (`хост:порт` через запятую
+— например, ssh прода) и `--probe хост:порт` на запрос не отдаёт данных (соединение без ответа —
+❌: закрытость не доказана); снаружи — смонтировано ровно клон и копия канона, сеть песочницы
+разрешает только список, проброс агента выключен, общая политика ничего не пускает, общих
+ключей нет; gitleaks внутри — на PATH, той же версии, что на Mac; при `canon.sandboxBrowser` —
+образ браузера pin проекта внутри и Chromium в нём (pin сменили без загрузки — ❌). Вход Claude
+и незаданный браузер — строкой, не ❌.
+
+`login` — интерактивный `sbx run` песочницы: владелец набирает `/login` (подписка Claude) один
+раз на все песочницы: `sbx` хранит вход на хосте общим секретом `anthropic` и подставляет его
+прокси, внутри — только заглушки `proxy-managed` (прогон 19.10). `exec` — команда в клоне
+внутри песочницы, код — её код.
+`load-image` — `docker save` на хосте → `docker load` внутри: сборка внутри не проходит
+(разведка #210). `stop` — остановить; `rm` — удалить песочницу (клон остаётся).
+
+Ошибка — код 1 и сообщение `sandbox:` в stderr, ошибка аргументов — код 2.
+Файл вендорится из канона `alexkabchina-arch/workflow`: руками не править.
+Только стандартная библиотека Python 3.
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import http.client
+import json
+import os
+import re
+import shutil
+import signal
+import subprocess
+import sys
+import tarfile
+import tempfile
+import urllib.request
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+CANON_MOUNT = HERE.parents[1]  # <копия канона>/project: скрипты канона, без секретов владельца
+HOSTS = (
+    "github.com",
+    "api.github.com",
+    "codeload.github.com",
+    "uploads.github.com",
+    "objects.githubusercontent.com",
+    "raw.githubusercontent.com",
+    "release-assets.githubusercontent.com",
+    "pypi.org",
+    "files.pythonhosted.org",
+    "registry.npmjs.org",
+    "registry-1.docker.io",
+    "auth.docker.io",
+    "production.cloudflare.docker.com",
+    "production.cloudfront.docker.com",  # слои Docker Hub (прогон 19.10)
+)
+HOSTS_KEY = "canon.sandboxHosts"
+MEMORY_KEY = "canon.sandboxMemory"
+PROBE_KEY = "canon.sandboxProbe"
+HOST_PROBE = "host.docker.internal:22"  # sshd Mac: прямой TCP к хосту не должен отдать данных
+DENIED_HOST = "example.com"  # домен вне списка
+DENIED_URL = f"https://{DENIED_HOST}"
+AGENT_SETTING = "ssh.agentForwardingEnabled"
+# Общие секреты sbx, которым место во всех песочницах: вход Claude по подписке (`/login` внутри
+# сохраняет его общим секретом на хосте, внутрь попадает только заглушка).
+SHARED_SECRETS = {"anthropic"}
+# gitleaks внутри песочницы (#283): версия — та же, что в CI и на Mac; суммы архивов linux —
+# из `gitleaks_<версия>_checksums.txt` релиза. Каталог установки внутри — `CANON_SANDBOX_BIN`
+# (только для тестов: их «песочница» — хост).
+GITLEAKS_VERSION = "8.30.1"
+GITLEAKS_SHA256 = {
+    "arm64": "e4a487ee7ccd7d3a7f7ec08657610aa3606637dab924210b3aee62570fb4b080",
+    "x64": "551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb",
+}
+GITLEAKS_URL = (
+    "https://github.com/gitleaks/gitleaks/releases/download/v{v}/gitleaks_{v}_linux_{arch}.tar.gz"
+)
+GITLEAKS_LIMIT = 200 * 2**20  # архив и файл больше — не gitleaks
+ARCHES = {"aarch64": "arm64", "arm64": "arm64", "x86_64": "x64", "amd64": "x64"}
+GITLEAKS_INSIDE = "command -v gitleaks >/dev/null && gitleaks version"
+INSTALL = (
+    'd="${CANON_SANDBOX_BIN:-/usr/local/bin}"; t=$(mktemp) || exit 1; cat > "$t" && '
+    '{ install -m 755 "$t" "$d/gitleaks" 2>/dev/null || sudo -n install -m 755 "$t" '
+    '"$d/gitleaks"; }; rc=$?; rm -f "$t"; exit $rc'
+)
+# Браузер для `/verify` под оркестратором (#292): образ Playwright версии pin проекта. Имя образа
+# печатает команда проекта (`sh -c` в главном чекауте) — канон версию не знает.
+BROWSER_KEY = "canon.sandboxBrowser"
+BROWSER_TIMEOUT = 60  # вычисление имени, не сборка
+IMAGE_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/:@-]*")
+CHROMIUM_INSIDE = "ls -d /ms-playwright/chromium-[0-9]*"  # ревизии Chromium в образе
+ENV_NAMES = ("", ".local", ".production", ".prod", ".development", ".dev", ".test")
+SKIP_DIRS = {".git", "node_modules", ".venv", "venv", "__pycache__", ".claude"}
+
+# Проверка изнутри: аргумент — JSON {host_home, mounts, owner_paths, canon, targets, denied};
+# вывод — JSON-список {name, ok, detail}. Только стандартная библиотека: Python образа песочницы.
+# Хешей файлов владельца в аргументе нет: командную строку пробы видят процессы сессий.
+PROBE = r"""
+import json, os, re, shutil, socket, subprocess, sys, urllib.request
+a = json.loads(sys.argv[1])
+res = []
+def put(name, ok, detail):
+    res.append({"name": name, "ok": bool(ok), "detail": detail})
+def stub(value):
+    # Заглушка прокси sbx: `proxy-managed`, `sk-ant-…-proxy-managed`, `gho_sbxproxymanaged000…`.
+    return bool(re.fullmatch(r"(?:[\w-]+-)?proxy-managed|gho_sbxproxymanaged0+", value))
+home = os.path.expanduser("~")
+put("ssh", not os.path.exists(os.path.join(home, ".ssh")), f"{home}/.ssh")
+put("keychain", shutil.which("security") is None, "security (связка ключей macOS)")
+# Домашняя папка владельца: на каждом уровне цепочки к смонтированной папке — только следующий
+# каталог цепочки, сами смонтированные папки не разбираются.
+hh = a["host_home"]
+inner = [m for m in a["mounts"] if m != hh and os.path.commonpath([m, hh]) == hh]
+allowed = {}
+for m in inner:
+    parts = os.path.relpath(m, hh).split(os.sep)
+    for i in range(len(parts)):
+        allowed.setdefault(os.path.join(hh, *parts[:i]), set()).add(parts[i])
+listed = []
+for d, names in sorted(allowed.items()):
+    if os.path.isdir(d):
+        listed += [os.path.join(d, x) for x in sorted(os.listdir(d)) if x not in names]
+if os.path.isdir(hh) and not allowed:
+    listed += [os.path.join(hh, x) for x in sorted(os.listdir(hh))]
+# Данные Mac приходят только монтированием (virtiofs, своё устройство); файлы на корневой ФС VM
+# создал сам sbx (его CLAUDE.md и kits-agent-context рядом с клоном) — не владельца. Корень VM —
+# `CANON_PROBE_ROOT`, только для тестов (у их «песочницы» ФС общая с хостом).
+root = os.stat(os.environ.get("CANON_PROBE_ROOT", "/")).st_dev
+own = [p for p in listed if not os.path.ismount(p) and os.lstat(p).st_dev == root]
+extra = [p for p in listed if p not in own]
+note = f"; свои файлы sbx: {', '.join(own)}" if own else ""
+clean = f"{hh}: только пути к смонтированным папкам"
+put("host_home", not extra, (", ".join(extra) or clean) + note)
+seen = [p for p in a["owner_paths"] if os.path.exists(p)]
+hidden = f"файлов .env владельца не видно: {len(a['owner_paths'])}"
+put("owner_env", not seen, ", ".join(seen) or hidden)
+keys = re.compile(r"TOKEN|KEY|SECRET|PASS|AUTH|CREDENTIAL", re.I)
+leaked = [k for k, v in os.environ.items() if keys.search(k) and not k.startswith("SSH_AUTH_SOCK")
+          and v and not stub(v)]
+put("env", not leaked, ", ".join(sorted(leaked)) or "только заглушки прокси sbx")
+agent = "агента нет"
+ok = True
+if os.environ.get("SSH_AUTH_SOCK"):
+    r = subprocess.run(["ssh-add", "-l"], capture_output=True, text=True)
+    ok = r.returncode != 0
+    agent = "ключей нет" if ok else f"ключей: {len(r.stdout.splitlines())}"
+put("ssh_agent", ok, agent)
+cred = os.path.join(home, ".claude", ".credentials.json")
+real = []
+if os.path.exists(cred):
+    with open(cred) as f:
+        oauth = json.load(f).get("claudeAiOauth") or {}
+    real = [k for k in ("accessToken", "refreshToken") if oauth.get(k) and not stub(oauth[k])]
+put("claude_token", not real, ", ".join(real) or "внутри только заглушки прокси sbx")
+probe = os.path.join(a["canon"], ".sandbox-probe")
+try:
+    open(probe, "w").close()
+except OSError:
+    put("canon_ro", True, f"{a['canon']} — только чтение")
+else:
+    put("canon_ro", False, f"{a['canon']} доступна на запись")
+    try:
+        os.unlink(probe)
+    except OSError:
+        pass
+try:
+    code = urllib.request.urlopen(a["denied"], timeout=15).status
+except urllib.error.HTTPError as e:
+    code = e.code
+except Exception as e:
+    code = type(e).__name__
+put("network", code != 200, f"{a['denied']} → {code}")
+# Прямой TCP: после соединения — запрос; данные в ответ (баннер sshd, ответ HTTP, TLS или
+# Postgres на мусор) — порт открыт; соединение закрыто без данных (так закрывает прокси sbx) или
+# не установлено — закрыт; соединение есть, но ответа нет — не доказано, что закрыт.
+for target in a["targets"]:
+    host, _, port = target.rpartition(":")
+    try:
+        s = socket.create_connection((host, int(port)), timeout=5)
+    except socket.gaierror:
+        put(f"tcp {target}", True, "имя не разрешается внутри")
+        continue
+    except (ConnectionError, socket.timeout) as e:
+        put(f"tcp {target}", True, f"нет соединения ({type(e).__name__})")
+        continue
+    except Exception as e:
+        put(f"tcp {target}", False, f"проба не прошла: {type(e).__name__}")
+        continue
+    with s:
+        s.settimeout(5)
+        try:
+            s.sendall(b"HEAD / HTTP/1.0\r\n\r\n")
+            got = s.recv(64)
+        except socket.timeout:
+            put(f"tcp {target}", False, "соединение открыто, ответа нет — закрытость не доказана")
+            continue
+        except ConnectionError:
+            got = b""
+    if got:
+        put(f"tcp {target}", False, "данные: " + got[:20].decode(errors="replace").strip())
+    else:
+        put(f"tcp {target}", True, "соединение закрыто без данных")
+print(json.dumps(res, ensure_ascii=False))
+"""
+
+
+class Failure(Exception):
+    pass
+
+
+class UsageError(Exception):
+    pass
+
+
+def say(text: str) -> None:
+    print(f"sandbox: {text}", flush=True)
+
+
+def run(*cmd: str, cwd: Path | None = None, input: str | None = None):
+    try:
+        return subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, input=input)
+    except FileNotFoundError:
+        raise Failure(f"нет `{cmd[0]}` на PATH") from None
+
+
+def tail(res) -> str:
+    text = (res.stderr or res.stdout or "").strip()
+    return text.splitlines()[-1] if text else f"код {res.returncode}"
+
+
+def sbx(*args: str, input: str | None = None):
+    if shutil.which("sbx") is None:
+        raise Failure(
+            "нет `sbx` (Docker Sandboxes): `brew install docker/tap/sbx` — docs/sandbox.md"
+        )
+    return run("sbx", *args, input=input)
+
+
+def sbx_ok(*args: str) -> str:
+    res = sbx(*args)
+    if res.returncode != 0:
+        raise Failure(f"sbx {args[0]}: {tail(res)}")
+    return res.stdout
+
+
+def sbx_json(*args: str):
+    out = sbx_ok(*args)
+    try:
+        return json.loads(out)
+    except ValueError:
+        raise Failure(f"sbx {args[0]}: ответ не JSON") from None
+
+
+def rules_of(text: str) -> list[dict]:
+    """Правила из `sbx policy ls --json`: `{"rules": [...]}`."""
+    try:
+        rules = json.loads(text).get("rules") or []
+    except (ValueError, AttributeError):
+        raise Failure("sbx policy ls: ответ не по формату") from None
+    return [r for r in rules if isinstance(r, dict)]
+
+
+def digest(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def version_of(text: str) -> str | None:
+    """Версия из вывода `gitleaks version` (`8.30.1` или `v8.30.1`)."""
+    lines = text.strip().splitlines()
+    return (lines[-1].strip().removeprefix("v") or None) if lines else None
+
+
+def mac_gitleaks() -> str | None:
+    """Версия gitleaks на PATH Mac; нет его или не ответил — None."""
+    if shutil.which("gitleaks") is None:
+        return None
+    res = run("gitleaks", "version")
+    return version_of(res.stdout) if res.returncode == 0 else None
+
+
+def gitleaks_file(arch: str) -> Path:
+    """Файл `gitleaks` релиза `GITLEAKS_VERSION` под linux `arch` из кэша `~/.canon/tools/`;
+    нет — архив с GitHub, сверка суммы, из архива — только файл `gitleaks`. В кэш попадает
+    только сверенное."""
+    if arch not in GITLEAKS_SHA256:
+        raise Failure(f"gitleaks для песочницы: архитектура {arch!r} не поддержана")
+    tools = Path.home() / ".canon/tools"
+    cached = tools / f"gitleaks-{GITLEAKS_VERSION}-linux-{arch}"
+    if cached.is_file():
+        return cached
+    url = GITLEAKS_URL.format(v=GITLEAKS_VERSION, arch=arch)
+    tools.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(dir=tools) as tmp:
+        archive = Path(tmp) / "gitleaks.tar.gz"
+        try:
+            with urllib.request.urlopen(url, timeout=120) as res, open(archive, "wb") as out:
+                while chunk := res.read(2**20):
+                    out.write(chunk)
+                    if out.tell() > GITLEAKS_LIMIT:
+                        raise Failure(f"архив gitleaks больше {GITLEAKS_LIMIT // 2**20} МБ")
+        except (OSError, http.client.HTTPException) as exc:  # и обрыв посреди архива
+            raise Failure(f"архив gitleaks не скачан ({url}): {exc!r}") from None
+        if digest(archive) != GITLEAKS_SHA256[arch]:
+            raise Failure(f"контрольная сумма архива gitleaks не совпала ({url}) — не ставим")
+        try:
+            with tarfile.open(archive, "r:gz") as tar:
+                member = tar.getmember("gitleaks")
+                if not member.isfile() or member.size > GITLEAKS_LIMIT:
+                    raise Failure("в архиве gitleaks `gitleaks` — не обычный файл")
+                data = tar.extractfile(member).read()
+        except (tarfile.TarError, KeyError) as exc:
+            raise Failure(f"архив gitleaks не разобран: {exc}") from None
+        part = Path(tmp) / "gitleaks"
+        part.write_bytes(data)
+        part.chmod(0o755)
+        part.replace(cached)
+    return cached
+
+
+class Sandbox:
+    def __init__(self):
+        res = run("git", "worktree", "list", "--porcelain")
+        if res.returncode != 0:
+            raise Failure("не git-репозиторий: запуск — из главного чекаута проекта")
+        trees = [
+            Path(line[len("worktree ") :]).resolve()
+            for line in res.stdout.splitlines()
+            if line.startswith("worktree ")
+        ]
+        self.main = trees[0]
+        self.trees = trees
+        digest = hashlib.sha1(str(self.main).encode()).hexdigest()[:6]
+        slug = re.sub(r"[^a-z0-9-]+", "-", self.main.name.lower()).strip("-") or "project"
+        self.name = f"canon-{slug}-{digest}"
+        self.home = Path.home() / ".canon/sandbox" / f"{slug}-{digest}"
+        self.clone = self.home / "clone"
+        self.mounts = [str(self.clone), f"{CANON_MOUNT}:ro"]
+
+    def inside_project(self) -> bool:
+        return any(HERE.is_relative_to(tree) for tree in self.trees)
+
+    def config(self, key: str) -> str:
+        return run("git", "-C", str(self.main), "config", "--get", key).stdout.strip()
+
+    def hosts(self) -> list[str]:
+        extra = [h.strip() for h in self.config(HOSTS_KEY).split(",") if h.strip()]
+        return list(dict.fromkeys([*HOSTS, *extra]))
+
+    def entry(self) -> dict | None:
+        res = sbx("ls", "--json")
+        if res.returncode != 0:
+            raise Failure(f"sbx ls: {tail(res)} (вход — `sbx login`)")
+        try:
+            boxes = json.loads(res.stdout)
+        except ValueError:
+            raise Failure("sbx ls: ответ не JSON") from None
+        return next((b for b in boxes if b.get("name") == self.name), None)
+
+    def require(self) -> dict:
+        entry = self.entry()
+        if entry is None:
+            raise Failure(f"песочницы {self.name} нет — `sandbox up`")
+        return entry
+
+    # --- настройки sbx ---
+
+    def agent_forwarding(self) -> bool:
+        data = sbx_json("settings", "get", AGENT_SETTING, "--json")
+        return data.get("value") is not False
+
+    def global_policy(self) -> list[str]:
+        """Что не так с общей политикой сети: пускает что-то всем или нет запрета всего."""
+        res = sbx("policy", "ls", "--json", "--type", "network")
+        if res.returncode != 0:
+            return [f"общая политика сети не задана ({tail(res)})"]
+        rules = rules_of(res.stdout)
+        problems = [
+            f"общее правило пускает {', '.join(r.get('resources') or [])}"
+            for r in rules
+            if r.get("applies_to") == "all"
+            and r.get("resource_type") == "network"
+            and r.get("decision") == "allow"
+        ]
+        # Сам общий запрет в `policy ls --json` не виден (sbx 0.48) — его даёт `policy check`.
+        res = sbx("policy", "check", "network", DENIED_HOST, "--json")
+        try:
+            allowed = json.loads(res.stdout).get("allowed")
+        except (ValueError, AttributeError):
+            allowed = None
+        if allowed is not False:
+            problems.append(
+                f"общая политика не запрещает {DENIED_HOST} (`sbx policy init deny-all`)"
+            )
+        return problems
+
+    def global_secrets(self) -> list[str]:
+        data = sbx_json("secret", "ls", "--json")
+        if not isinstance(data, dict):
+            raise Failure("sbx secret ls: ответ не по формату")
+        return [
+            str(s.get("name") or s.get("service") or s)
+            for s in data.get("secrets") or []
+            if isinstance(s, dict)
+            and s.get("scope") == "global"
+            and s.get("name") not in SHARED_SECRETS
+        ]
+
+    def extra_hosts(self) -> list[str]:
+        """Домены, которые песочнице разрешены сверх списка (`hosts()`) и правила kit `sbx`."""
+        rules = rules_of(sbx_ok("policy", "ls", self.name, "--json", "--type", "network"))
+        wanted = set(self.hosts())
+        return [
+            host
+            for r in rules
+            if r.get("decision") == "allow"
+            and (r.get("provenance") or {}).get("created_via") != "provisioned"
+            for host in r.get("resources") or []
+            if host not in wanted
+        ]
+
+    # --- команды ---
+
+    def up(self, memory: str | None) -> None:
+        self.entry()  # вход в Docker — до правок
+        if self.agent_forwarding():
+            sbx_ok("settings", "set", AGENT_SETTING, "false")
+            say("проброс SSH-агента в песочницы выключен")
+        res = sbx("policy", "ls", "--json", "--type", "network")
+        if res.returncode != 0 and "not been initialized" in (res.stderr + res.stdout):
+            sbx_ok("policy", "init", "deny-all")
+            say("общая политика сети — «запрещено всё»")
+        problems = self.global_policy()
+        if problems:
+            raise Failure(
+                "общая политика сети не годится: "
+                + "; ".join(problems)
+                + " — песочница была бы открыта (`sbx policy reset`, затем снова `sandbox up`)"
+            )
+        secrets = self.global_secrets()
+        if secrets:
+            raise Failure(
+                f"общие ключи в sbx secret: {', '.join(secrets)} — ушли бы во все песочницы "
+                "(`sbx secret rm …`)"
+            )
+        if not self.clone.exists():
+            origin = run("git", "-C", str(self.main), "remote", "get-url", "origin")
+            if origin.returncode != 0 or not origin.stdout.strip():
+                raise Failure("у главного чекаута нет `origin` — клонировать нечего")
+            self.home.mkdir(parents=True, exist_ok=True)
+            res = run("git", "clone", "--quiet", origin.stdout.strip(), str(self.clone))
+            if res.returncode != 0:
+                raise Failure(f"git clone: {tail(res)}")
+            say(f"клон проекта без .env — {self.clone}")
+        entry = self.entry()
+        if entry is None:
+            memory = memory or self.config(MEMORY_KEY)
+            args = ["create", "--name", self.name, "--no-progress"]
+            args += ["--memory", memory] if memory else []
+            sbx_ok(*args, "claude", *self.mounts)
+            say(f"песочница {self.name} создана")
+        elif list(entry.get("workspaces") or []) != self.mounts:
+            have = ", ".join(entry.get("workspaces") or [])
+            raise Failure(
+                f"песочница {self.name} смонтирована иначе ({have}), а нужно "
+                f"{', '.join(self.mounts)} — `sandbox rm`, затем `sandbox up`; `rm` удалит "
+                "транскрипты сессий тикетов в работе — сначала полный простой оркестратора "
+                "(`orchestrator status`: «Простой полный», docs/sandbox.md); переезд копии канона "
+                "на постоянный адрес — `orchestrator update <тег>`, он ждёт простоя сам"
+            )
+        else:
+            say(f"песочница {self.name} уже есть")
+            memory = memory or self.config(MEMORY_KEY)
+            if memory and memory != entry.get("memory"):
+                have = entry.get("memory") or "по умолчанию sbx"
+                say(
+                    f"память {memory} не применена: у песочницы {have}, размер задаётся при "
+                    "создании — `sandbox rm`, затем `up`"
+                )
+        sbx_ok("policy", "allow", "network", "--sandbox", self.name, ",".join(self.hosts()))
+        for host in self.extra_hosts():
+            sbx_ok("policy", "rm", "network", "--sandbox", self.name, "--resource", host)
+            say(f"сеть: {host} больше не разрешён (нет в списке)")
+        say(f"сеть: запрещено всё, кроме {len(self.hosts())} доменов и доменов Anthropic")
+        self.install_gitleaks()
+        try:
+            self.deliver_browser()
+        except Failure as exc:  # браузер нужен только тикетам с интерфейсом: строка, не сбой
+            say(
+                f"браузер для /verify не готов: {exc} — тикет с интерфейсом под оркестратором "
+                "остановится на /verify; `sandbox check` — строка `browser`"
+            )
+        if not self.logged_in():
+            say("вход Claude в песочнице не выполнен — `sandbox login` (один раз)")
+
+    def gitleaks_inside(self) -> str | None:
+        """Версия gitleaks на PATH внутри песочницы; нет — None."""
+        res = sbx("exec", self.name, "sh", "-c", GITLEAKS_INSIDE)
+        return version_of(res.stdout) if res.returncode == 0 else None
+
+    def install_gitleaks(self) -> None:
+        """gitleaks `GITLEAKS_VERSION` внутрь (#283): уже стоит — без скачивания; поставленный —
+        сверка версии; на Mac другая версия — строка (проверка `secrets` идёт и там)."""
+        if self.gitleaks_inside() == GITLEAKS_VERSION:
+            say(f"gitleaks {GITLEAKS_VERSION} в песочнице уже есть")
+        else:
+            machine = sbx("exec", self.name, "uname", "-m").stdout.strip()
+            binary = gitleaks_file(ARCHES.get(machine, machine))
+            with open(binary, "rb") as data:
+                res = subprocess.run(
+                    ["sbx", "exec", "-i", self.name, "sh", "-c", INSTALL],
+                    stdin=data,
+                    capture_output=True,
+                )
+            have = self.gitleaks_inside()
+            if res.returncode != 0 or have != GITLEAKS_VERSION:
+                why = res.stderr.decode(errors="replace").strip() or f"код {res.returncode}"
+                raise Failure(
+                    f"gitleaks {GITLEAKS_VERSION} в песочницу не встал ({why}; внутри — "
+                    f"{have or 'нет'}): без него проверка `secrets` внутри красная; файл из "
+                    f"кэша — {binary}: удалите его, `up` скачает заново"
+                )
+            say(f"gitleaks {GITLEAKS_VERSION} поставлен в песочницу")
+        mac = mac_gitleaks()
+        if mac != GITLEAKS_VERSION:
+            say(
+                f"на Mac gitleaks {mac or 'нет'}, а в песочнице {GITLEAKS_VERSION} — нужна та же "
+                "версия (docs/secrets.md)"
+            )
+
+    def logged_in(self) -> bool:
+        res = sbx("exec", self.name, "claude", "auth", "status")
+        try:
+            return bool(json.loads(res.stdout).get("loggedIn"))
+        except (ValueError, AttributeError):
+            return False
+
+    def owner_files(self) -> list[Path]:
+        """Неотслеживаемые `.env` главного чекаута: в git их нет, значит, это файлы владельца."""
+        res = run("git", "-C", str(self.main), "ls-files", "-z")
+        tracked = {self.main / rel for rel in res.stdout.split("\0") if rel}
+        found = []
+        for root, dirs, files in os.walk(self.main):
+            depth = Path(root).relative_to(self.main).parts
+            dirs[:] = [d for d in dirs if d not in SKIP_DIRS and len(depth) < 4]
+            for name in files:
+                if name.startswith(".env") and name[len(".env") :] in ENV_NAMES:
+                    path = Path(root) / name
+                    if path not in tracked and path.is_file():
+                        found.append(path)
+        return found
+
+    def copied(self, files: list[Path]) -> list[str]:
+        """Копии `.env` владельца в клоне — сверка по хешу на хосте: клон — папка Mac."""
+        found = []
+        for path in files:
+            copy = self.clone / path.relative_to(self.main)
+            try:
+                if copy.is_file() and digest(copy) == digest(path):
+                    found.append(str(copy))
+            except OSError:
+                continue
+        return found
+
+    def browser(self) -> str | None:
+        """Образ браузера для `/verify` (#292) — вывод `canon.sandboxBrowser` в главном чекауте:
+        ровно одно имя образа. Ключа нет — None; сбой, пустой вывод или не имя — `Failure`."""
+        command = self.config(BROWSER_KEY)
+        if not command:
+            return None
+        what = f"образ браузера (`{BROWSER_KEY}`)"
+        # Своя группа процессов: по пределу убивается вся, иначе потомок, держащий вывод, повесил
+        # бы `communicate` без предела.
+        proc = subprocess.Popen(
+            ["sh", "-c", command],
+            cwd=self.main,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            start_new_session=True,
+        )
+        try:
+            out, err = proc.communicate(timeout=BROWSER_TIMEOUT)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            proc.communicate()
+            raise Failure(f"{what}: дольше {BROWSER_TIMEOUT} с") from None
+        if proc.returncode != 0:
+            text = (err or out).strip()
+            raise Failure(f"{what}: {text.splitlines()[-1] if text else f'код {proc.returncode}'}")
+        names = out.split()
+        if len(names) != 1 or not IMAGE_NAME.fullmatch(names[0]):
+            raise Failure(f"{what}: нужно одно имя образа, а вывод — «{out.strip()[:80]}»")
+        return names[0]
+
+    def image_id(self, image: str, inside: bool) -> str | None:
+        cmd = ("docker", "image", "inspect", "-f", "{{.Id}}", image)
+        res = sbx("exec", self.name, *cmd) if inside else run(*cmd)
+        return res.stdout.strip() or None if res.returncode == 0 else None
+
+    def deliver_browser(self) -> None:
+        """Образ браузера — в песочницу (#292): нет на Mac — `docker pull`; внутри другого id или
+        нет — `docker save` → `docker load`, как `load-image`. В VM ничего не ставится."""
+        image = self.browser()
+        if image is None:
+            say(
+                f"браузер для /verify не задан (`{BROWSER_KEY}`): тикет с интерфейсом под "
+                "оркестратором остановится на /verify — docs/sandbox.md, «Браузер для /verify»"
+            )
+            return
+        mac = self.image_id(image, inside=False)
+        if mac is None:
+            say(f"браузер для /verify: качаю {image} на Mac")
+            res = run("docker", "pull", image)
+            mac = self.image_id(image, inside=False)
+            if res.returncode != 0 or mac is None:
+                raise Failure(f"docker pull {image}: {tail(res)}")
+        if self.image_id(image, inside=True) == mac:
+            say(f"браузер для /verify: {image} в песочнице уже есть")
+            return
+        self.load_image([image])
+
+    def browser_row(self) -> dict | None:
+        """Строка `browser` проверки (#292): образ pin проекта внутри и Chromium в нём. Ключа нет
+        — None (строка вне ✅/❌: проекту без интерфейса браузер не нужен)."""
+        try:
+            image = self.browser()
+        except Failure as exc:
+            return {"name": "browser", "ok": False, "detail": str(exc)}
+        if image is None:
+            return None
+        if self.image_id(image, inside=True) is None:
+            return {
+                "name": "browser",
+                "ok": False,
+                "detail": f"{image} (pin проекта) в песочнице нет — `sandbox up` загрузит; без "
+                "него тикет с интерфейсом под оркестратором остановится на /verify",
+            }
+        probe = ("docker", "run", "--rm", "--network", "none", "--entrypoint", "sh", image, "-c")
+        res = sbx("exec", self.name, *probe, CHROMIUM_INSIDE)
+        found = [Path(x).name for x in res.stdout.split() if res.returncode == 0]
+        return {
+            "name": "browser",
+            "ok": bool(found),
+            "detail": f"{image}: {', '.join(found)}"
+            if found
+            else f"{image}: Chromium в образе не найден ({tail(res)})",
+        }
+
+    def check(self, probes: list[str]) -> int:
+        configured = [t.strip() for t in self.config(PROBE_KEY).split(",") if t.strip()]
+        targets = list(dict.fromkeys([HOST_PROBE, *configured, *probes]))
+        for target in targets:
+            host, _, port = target.rpartition(":")
+            if (
+                not host
+                or ":" in host
+                or "[" in host
+                or not (port.isascii() and port.isdigit() and 0 < int(port) < 65536)
+            ):
+                raise UsageError(f"цель проверки — хост:порт (порт 1–65535), а не {target!r}")
+        entry = self.require()
+        files = self.owner_files()
+        mounted = list(entry.get("workspaces") or [])
+        args = {
+            "host_home": str(Path.home()),
+            "mounts": [w.removesuffix(":ro") for w in mounted],
+            "owner_paths": [str(f) for f in files],
+            "canon": str(CANON_MOUNT),
+            "targets": targets,
+            "denied": DENIED_URL,
+        }
+        res = sbx("exec", self.name, "python3", "-c", PROBE, json.dumps(args, ensure_ascii=False))
+        try:
+            rows = json.loads(res.stdout.strip().splitlines()[-1])
+        except (ValueError, IndexError):
+            raise Failure(f"проверка внутри песочницы не прошла: {tail(res)}") from None
+        copies = self.copied(files)
+        for row in rows:
+            if row["name"] == "owner_env" and copies:
+                seen = [] if row["ok"] else [row["detail"]]
+                row.update(ok=False, detail=", ".join([*seen, *copies]))
+        rows.append(
+            {
+                "name": "mounts",
+                "ok": mounted == self.mounts,
+                "detail": ", ".join(mounted)
+                + ("" if mounted == self.mounts else f" — а нужно {', '.join(self.mounts)}"),
+            }
+        )
+        extra = self.extra_hosts()
+        rows.append(
+            {
+                "name": "allowlist",
+                "ok": not extra,
+                "detail": (", ".join(extra) + " — сверх списка")
+                if extra
+                else f"разрешено только из списка ({len(self.hosts())}) и домены Anthropic",
+            }
+        )
+        rows.append(
+            {
+                "name": "ssh_forwarding",
+                "ok": not self.agent_forwarding(),
+                "detail": f"{AGENT_SETTING} в настройках sbx",
+            }
+        )
+        problems = self.global_policy()
+        rows.append(
+            {
+                "name": "policy",
+                "ok": not problems,
+                "detail": "; ".join(problems) or "общая — запрещено всё",
+            }
+        )
+        inside, mac = self.gitleaks_inside(), mac_gitleaks()
+        same = inside == mac == GITLEAKS_VERSION  # и та же, что закреплена в каноне (и в CI)
+        rows.append(
+            {
+                "name": "gitleaks",
+                "ok": same,
+                "detail": f"внутри {inside or 'нет'}, на Mac {mac or 'нет'}"
+                + ("" if same else f" — нужна {GITLEAKS_VERSION} в обоих местах: `sandbox up`"),
+            }
+        )
+        secrets = self.global_secrets()
+        rows.append(
+            {
+                "name": "secrets",
+                "ok": not secrets,
+                "detail": ", ".join(secrets) or "общих ключей нет",
+            }
+        )
+        browser = self.browser_row()
+        rows += [browser] if browser else []
+        for row in rows:
+            print(f"{'✅' if row['ok'] else '❌'} {row['name']} — {row['detail']}")
+        print(f"вход Claude: {'есть' if self.logged_in() else 'нет — `sandbox login`'}")
+        if browser is None:
+            print(
+                f"браузер для /verify: не задан (`{BROWSER_KEY}`) — тикет с интерфейсом под "
+                "оркестратором остановится на /verify"
+            )
+        return 0 if all(row["ok"] for row in rows) else 1
+
+    def status(self) -> None:
+        entry = self.require()
+        print(f"песочница: {self.name} — {entry.get('status')}")
+        print(f"клон: {self.clone}")
+        print(f"смонтировано: {', '.join(entry.get('workspaces') or [])}")
+        print(f"память: {entry.get('memory') or 'по умолчанию sbx'}")
+        if entry.get("status") == "running":
+            print(f"вход Claude: {'есть' if self.logged_in() else 'нет'}")
+        else:
+            print("вход Claude: не проверялся — песочница не запущена (`exec` её поднимет)")
+
+    def execute(self, command: list[str]) -> int:
+        self.require()
+        if not command:
+            raise UsageError("exec: нужна команда")
+        tty = ["-it"] if sys.stdin.isatty() and sys.stdout.isatty() else []
+        cmd = ["sbx", "exec", *tty, "-w", str(self.clone), self.name, *command]
+        return subprocess.run(cmd).returncode
+
+    def load_image(self, images: list[str]) -> None:
+        self.require()
+        if not images:
+            raise UsageError("load-image: нужен образ")
+        for image in images:
+            try:
+                save = subprocess.Popen(["docker", "save", image], stdout=subprocess.PIPE)
+            except FileNotFoundError:
+                raise Failure("нет `docker` на PATH — образ отдаёт Docker Mac") from None
+            load = subprocess.run(
+                ["sbx", "exec", "-i", self.name, "docker", "load"],
+                stdin=save.stdout,
+                capture_output=True,
+                text=True,
+            )
+            save.stdout.close()
+            if save.wait() != 0 or load.returncode != 0:
+                raise Failure(f"образ {image} не загружен: {tail(load)}")
+            say(f"образ {image} загружен в песочницу")
+
+    def login(self) -> int:
+        self.require()
+        say("откроется Claude внутри песочницы: наберите /login, войдите по подписке, затем /exit")
+        return subprocess.run(["sbx", "run", "--name", self.name]).returncode
+
+    def stop(self) -> None:
+        self.require()
+        sbx_ok("stop", self.name)
+        say(f"песочница {self.name} остановлена")
+
+    def remove(self) -> None:
+        if self.entry() is None:
+            say(f"песочницы {self.name} нет")
+            return
+        sbx_ok("rm", "--force", self.name)
+        say(f"песочница {self.name} удалена; клон остался — {self.clone}")
+
+
+def main(argv: list[str] | None = None) -> int:
+    argv = sys.argv[1:] if argv is None else argv
+    parser = argparse.ArgumentParser(prog="sandbox", description=__doc__.split("\n\n")[0])
+    sub = parser.add_subparsers(dest="command", required=True)
+    up = sub.add_parser("up", help="поднять песочницу проекта (повторно — та же)")
+    up.add_argument("--memory", help=f"память песочницы (по умолчанию git config {MEMORY_KEY})")
+    check = sub.add_parser("check", help="проверить изоляцию")
+    check.add_argument(
+        "--probe", action="append", default=[], metavar="ХОСТ:ПОРТ", help="ещё цель прямого TCP"
+    )
+    sub.add_parser("login", help="вход Claude внутри песочницы")
+    sub.add_parser("status", help="состояние песочницы")
+    ex = sub.add_parser("exec", help="команда в клоне внутри песочницы")
+    ex.add_argument("cmd", nargs=argparse.REMAINDER)
+    load = sub.add_parser("load-image", help="образ docker с хоста — внутрь")
+    load.add_argument("images", nargs="+")
+    sub.add_parser("stop", help="остановить песочницу")
+    sub.add_parser("rm", help="удалить песочницу (клон остаётся)")
+    args = parser.parse_args(argv)
+    try:
+        box = Sandbox()
+        if box.inside_project():
+            print(
+                f"sandbox: запуск из проекта ({HERE}) — нужен из своей копии канона: иначе в "
+                "песочницу ушли бы скрипты, которые правят сессии",
+                file=sys.stderr,
+            )
+            return 2
+        if args.command == "up":
+            box.up(args.memory)
+        elif args.command == "check":
+            return box.check(args.probe)
+        elif args.command == "login":
+            return box.login()
+        elif args.command == "status":
+            box.status()
+        elif args.command == "exec":
+            cmd = args.cmd[1:] if args.cmd[:1] == ["--"] else args.cmd
+            return box.execute(cmd)
+        elif args.command == "load-image":
+            box.load_image(args.images)
+        elif args.command == "stop":
+            box.stop()
+        else:
+            box.remove()
+    except UsageError as exc:
+        print(f"sandbox: {exc}", file=sys.stderr)
+        return 2
+    except Failure as exc:
+        print(f"sandbox: {exc}", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

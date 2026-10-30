@@ -1,0 +1,36 @@
+# Пути-ограничители канона (ADR-0004; решение `docs/decisions/2026-10-08-no-restricted-paths.md`
+# в каноне): одобрение CODEOWNERS (набор правил `protect-main`) — PR других людей (партнёра,
+# Dependabot) ждёт ревью владельца. PR под учётной записью владельца, в том числе агентский,
+# одобрения не ждёт (GitHub не требует его от автора-код-оунера, проверено в Г2 #114) и сливается
+# авто-мёржем; его изменения правил ловит ревью ошибок — вопросом об ослаблении защиты.
+#
+# Шаблон копируется в проект один раз (`.github/CODEOWNERS`) и дальше принадлежит проекту.
+# Порядок важен: последнее совпавшее правило побеждает — проектные строки дописывать в конец.
+
+# Вендоренные файлы канона: `scripts/canon/`; настройки Claude Code — база канона, склейка
+# и проектные добавки (`.claude/settings.project.json`). Прочие вендоренные файлы ловит
+# `.canon.lock` в CI; рецепты `/verify` (`.claude/skills/run-*`) заводятся при переносе и
+# правятся отдельным PR с ревью ошибок; изменения от `/verify` в PR тикета `/ship` не принимает.
+/scripts/canon/                 @alexkabchina-arch
+/.claude/settings*.json         @alexkabchina-arch
+/.canon.lock                    @alexkabchina-arch
+
+# Workflow CI и сам этот файл.
+/.github/                       @alexkabchina-arch
+
+# Профиль проекта: критичные зоны и ожидаемые job CI. CODEOWNERS не различает разделы
+# файла — под одобрением весь профиль.
+/docs/agents/profile.md         @alexkabchina-arch
+
+# Правила агенту — `CLAUDE.md` и `AGENTS.md` на любой глубине (Claude Code читает и вложенные,
+# аудит Fable 2.1.6, #61).
+CLAUDE.md                       @alexkabchina-arch
+CLAUDE.local.md                 @alexkabchina-arch
+AGENTS.md                       @alexkabchina-arch
+
+# Обязательный раздел `CLAUDE.md` — файл канона, подключённый импортом (#144): правило агенту,
+# как сам `CLAUDE.md`, хоть его содержимое и сверяет `.canon.lock`.
+/.claude/canon/                 @alexkabchina-arch
+
+# Инструмент проверки и карта функций для `/verify` пути v2 (спека воркфлоу #329, #351).
+/tools/verify/                  @alexkabchina-arch

@@ -1,0 +1,370 @@
+"""claude_run — общее для скриптов канона, запускающих дочерний `claude -p` (`review`, `verify`).
+
+`session-run` берёт отсюда только проверку предела `budget_usd`.
+
+Дочерний процесс — без меток сессии тикета (иначе Stop-хук `stop-check` держал бы его) и с
+переменными вызывающего поверх окружения (`env`: у `review` — `CLAUDE_CODE_REPORT_FINDINGS=1`), на
+закреплённой модели, с аргументами списком (без оболочки) и пустым stdin. Путь v2 (#333,
+`CANON_V2=1` в окружении — его ставит оркестратор): модель и усилие роли вызывающего скрипта из
+таблицы `v2/roles.py`; иначе — `MODEL` и усилие по умолчанию, как у старого пути. Окружением
+выбирается только «таблица или нет»: ни модель, ни усилие им не задать, и признак дочернему
+`claude` не передаётся. Итог — всегда по
+схеме (`--json-schema`): ответ — в поле `structured_output`, `.md` пишет вызывающий (из него или,
+как `review`, из событий потока).
+Текст `result` — только последняя реплика: у `/review` это сводка без находок (#70), поэтому итогом
+он не служит. Вывод — `json` или поток `stream-json` (у `review`: с `json` `/review` уходит в
+локальный режим мимо `claude -p`); итог — объект `result` (в потоке — последний с ответом по схеме:
+модель может ответить ещё раз после него, ozon #947; такой хвост — в поле `trailing_result`, его
+ошибка или упор в предел — предупреждение, а не сбой), сохраняется в `<отчёт.json>`. Инструменты
+фоновой работы `Agent`, `Workflow`, `Monitor` дочернему процессу запрещены (`--disallowedTools=…`):
+он наследует агентов личного слоя, а фоновая задача будит модель — лишний `result` и лишние траты.
+Фоновый Bash флагом не закрыть. Запуск не состоялся (сбой `claude`, выход по бюджету, ошибка, пустой
+`modelUsage`, не та модель, локальный режим, нет `structured_output`) — `ChildError` с причиной, а
+непустой `result` такого прогона — в `<отчёт>.raw.md` для разбора.
+
+`<отчёт>.md` бывает только у состоявшегося прогона. Перед новым запуском он и его `.json`
+переносятся в `<отчёт>.prev.md` и `.prev.json`: под основным именем не остаётся старый итог, а
+оплаченный отчёт не теряется, если новый прогон упадёт. Следы упавшего прогона (`.json`,
+`.raw.md`) новый запуск удаляет: его стоимость остаётся в транскрипте дочернего `claude`.
+
+Файл вендорится из канона `alexkabchina-arch/workflow`: руками не править.
+Только стандартная библиотека Python 3.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import math
+import os
+import re
+import subprocess
+import sys
+import types
+from pathlib import Path
+
+
+def load_roles():
+    """Таблица ролей пути v2 (`v2/roles.py` рядом) как модуль — без `sys.path` и `__pycache__`."""
+    path = Path(__file__).resolve().parent / "v2/roles.py"
+    module = types.ModuleType("canon_v2_roles")
+    module.__file__ = str(path)
+    exec(compile(path.read_text(encoding="utf-8"), str(path), "exec"), module.__dict__)
+    return module
+
+
+roles = load_roles()
+MODEL = "claude-opus-5-5"
+# Признак пути v2 — не дальше вызывающего скрипта: дочерний `claude` и его команды его не видят.
+SESSION_VARS = {"CANON_SESSION", "CANON_ENFORCE_STOP", roles.V2_ENV}
+DEFAULT_BASE = "origin/main"
+# Ревью Opus xhigh в разведке workflow#2 стоили 0,82–3,67 USD (в среднем 1,89); уточнить на пилоте.
+DEFAULT_BUDGET_USD = "10"
+# Многозначный флаг — в форме `--флаг=значение`, иначе съест следующий аргумент (audit.md).
+DISALLOWED_TOOLS = "--disallowedTools=Agent,Workflow,Monitor"
+# Как пишет предел человек: цифры и точка; без `inf`, экспоненты и `_`, которые съел бы float().
+BUDGET_FORMAT = re.compile(r"[0-9]+(?:\.[0-9]+)?")
+
+
+class ChildError(Exception):
+    """Дочерний `claude` не дал полного результата (код выхода 1 у вызывающего скрипта)."""
+
+
+class UsageError(Exception):
+    """Ошибка аргументов или git (код выхода 2 у вызывающего скрипта)."""
+
+
+def report_path(value: str) -> Path:
+    path = Path(value)
+    if path.suffix != ".json":
+        raise argparse.ArgumentTypeError(f"нужен путь .json (рядом пишется .md): {value}")
+    return path
+
+
+def budget_usd(value: str) -> str:
+    """Предел проверяется до запуска: после оплаченного прогона падать на разборе поздно."""
+    ok = BUDGET_FORMAT.fullmatch(value) is not None and 0 < float(value) < math.inf
+    if not ok:
+        raise argparse.ArgumentTypeError(f"нужно положительное число USD через точку: {value}")
+    return value
+
+
+def parser(prog: str, description: str) -> argparse.ArgumentParser:
+    """Общие аргументы: `<отчёт.json> [--base] [--max-budget-usd]`."""
+    result = argparse.ArgumentParser(prog=prog, description=description)
+    result.add_argument(
+        "report", type=report_path, help="файл сырого результата (.json); рядом — .md"
+    )
+    result.add_argument(
+        "--base", default=DEFAULT_BASE, help=f"база диффа (по умолчанию {DEFAULT_BASE})"
+    )
+    result.add_argument(
+        "--max-budget-usd",
+        type=budget_usd,
+        default=DEFAULT_BUDGET_USD,
+        help=f"предел объёма в USD по прайсу API (по умолчанию {DEFAULT_BUDGET_USD})",
+    )
+    return result
+
+
+def role(name: str | None = None) -> tuple[str, str | None]:
+    """Модель и усилие дочернего `claude -p`. Путь v2 (`CANON_V2=1`) — роль `name` (по умолчанию
+    имя вызывающего скрипта: `review`, `verify`) из таблицы `v2/roles.py`; роли нет —
+    `UsageError` до запуска. Иначе — `MODEL` без усилия."""
+    if os.environ.get(roles.V2_ENV) != "1":
+        return MODEL, None
+    name = name or Path(sys.argv[0]).name
+    if name not in roles.ROLES:
+        raise UsageError(f"путь v2: роли {name!r} нет в v2/roles.py")
+    return roles.ROLES[name]
+
+
+def child_env(extra: dict | None = None) -> dict:
+    """Окружение (с `extra` поверх) без меток сессии тикета: Stop-хук не должен держать дочерний
+    процесс."""
+    merged = {**os.environ, **(extra or {})}
+    return {k: v for k, v in merged.items() if k not in SESSION_VARS}
+
+
+def write_json(path: Path, data: dict) -> None:
+    path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+
+def write_text(path: Path, text: str) -> None:
+    path.write_text(text if text.endswith("\n") else text + "\n", encoding="utf-8")
+
+
+def sibling(report: Path, suffix: str) -> Path:
+    """`<отчёт><suffix>`: `.prev.md`, `.raw.md` и т. п. рядом с `<отчёт>.json`."""
+    return report.with_name(report.stem + suffix)
+
+
+def set_aside(report: Path) -> None:
+    """Готовый отчёт прошлого прогона — в `.prev`, следы упавшего — удалить."""
+    findings = report.with_suffix(".md")
+    if findings.exists():
+        findings.replace(sibling(report, ".prev.md"))
+        if report.exists():
+            report.replace(sibling(report, ".prev.json"))
+    report.unlink(missing_ok=True)
+    sibling(report, ".raw.md").unlink(missing_ok=True)
+
+
+def budget_verdict(cost, budget: str, what: str) -> dict:
+    """Перерасход по итоговой стоимости: предупреждение и признак ready-for-human (вдвое и больше).
+
+    `what` — начало предупреждения: «ревью стоило», «проверка стоила».
+    """
+    limit = float(budget)
+    known = isinstance(cost, (int, float))
+    over = known and cost > limit
+    return {
+        "cost_usd": cost if known else None,
+        "budget_usd": limit,
+        "over_budget": over,
+        "ready_for_human": known and cost >= 2 * limit,
+        "warning": f"{what} {cost:.2f} USD при пределе {budget} USD" if over else None,
+    }
+
+
+def run_claude(
+    args: list[str],
+    report: Path,
+    budget: str,
+    schema: dict,
+    events: list | None = None,
+    env: dict | None = None,
+) -> dict:
+    """Запускает `claude -p --model MODEL [--effort …] --max-budget-usd <budget> --output-format
+    json --json-schema <schema> --disallowedTools=Agent,Workflow,Monitor <args>` (модель и усилие —
+    `role()`).
+
+    Сохраняет сырой результат в `report`; возвращает разобранный JSON с ответом в
+    `structured_output` (объект), `.md` пишет вызывающий. Не состоялось — `ChildError`, непустой
+    `result` — в `<отчёт>.raw.md`.
+
+    С `events` (список) — `--output-format stream-json --verbose`: события потока дописываются в
+    `events`, итог — последнее событие `result` с ответом по схеме (тот же объект, что у
+    `json`; см. `last_result`).
+
+    `env` — переменные дочернему процессу поверх `child_env()`, независимо от окружения родителя;
+    метки сессии тикета (`SESSION_VARS`) не проходят и из него.
+    """
+    output = ["json"] if events is None else ["stream-json", "--verbose"]
+    model, effort = role()
+    command = [
+        "claude",
+        "-p",
+        "--model",
+        model,
+        *(["--effort", effort] if effort else []),
+        "--max-budget-usd",
+        budget,
+        "--output-format",
+        *output,
+        "--json-schema",
+        json.dumps(schema, ensure_ascii=False),
+        DISALLOWED_TOOLS,
+        *args,
+    ]
+    set_aside(report)
+    try:
+        proc = subprocess.run(
+            command,
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            env=child_env(env),
+        )
+    except FileNotFoundError:
+        raise ChildError("не найден `claude` на PATH") from None
+    try:
+        data = json.loads(proc.stdout) if events is None else last_result(proc.stdout, events)
+    except json.JSONDecodeError:
+        # Причина бывает в любом из потоков: stderr не должен затирать stdout. В потоке
+        # `stream-json` события — не причина: из stdout берутся только строки не JSON.
+        out = proc.stdout if events is None else "\n".join(noise(proc.stdout)) or proc.stdout
+        streams = (("stdout", out), ("stderr", proc.stderr))
+        tail = "; ".join(
+            f"{name}: {text.strip()[-1000:]}" for name, text in streams if text.strip()
+        )
+        raise ChildError(
+            f"claude вышел с кодом {proc.returncode} без JSON-результата: {tail}"
+        ) from None
+    if not isinstance(data, dict):
+        raise ChildError(f"claude вернул не объект JSON (код {proc.returncode})")
+
+    report.parent.mkdir(parents=True, exist_ok=True)
+    write_json(report, data)
+    try:
+        return check_result(data, report, budget, proc.returncode, model)
+    except ChildError as exc:
+        text = data.get("result")
+        if isinstance(text, str) and text.strip():
+            write_text(sibling(report, ".raw.md"), text)
+            raise ChildError(f"{exc}; сырой ответ — {sibling(report, '.raw.md')}") from None
+        raise
+
+
+def stream_lines(stdout: str) -> list[str]:
+    # Только по `\n`: `splitlines()` режет и по U+2028, который Node в JSON не экранирует.
+    return [line for line in stdout.split("\n") if line.strip()]
+
+
+def parse(line: str):
+    try:
+        return json.loads(line)
+    except json.JSONDecodeError:
+        return None
+
+
+def noise(stdout: str) -> list[str]:
+    """Строки потока не JSON — текст ошибки CLI, а не события."""
+    return [line for line in stream_lines(stdout) if parse(line) is None]
+
+
+def is_answer(event: dict) -> bool:
+    """Событие `result` с ответом по схеме: из них `last_result` берёт итог."""
+    return event.get("type") == "result" and isinstance(event.get("structured_output"), dict)
+
+
+def last_result(stdout: str, events: list) -> dict:
+    """События `stream-json` — в `events`; итог — последнее событие `result` с ответом по схеме.
+
+    После ответа по схеме бывает ещё `result` без него (модель ответила ещё раз после отчёта
+    фонового агента, ozon #947). Ответ принимается, хвост — в поле `trailing_result` итога
+    (`trailing_warning` даёт по нему предупреждение), стоимость — наибольшая среди событий
+    `result`: накопительна ли она в хвосте, не проверено вживую. Нет `result` с ответом по
+    схеме — последнее событие `result`: `check_result` назовёт причину. Строки не JSON (шум,
+    текст ошибки) пропускаются; нет события `result` — `JSONDecodeError`, как у сломанного
+    вывода `json`.
+    """
+    for line in stream_lines(stdout):
+        event = parse(line)
+        if isinstance(event, dict):
+            events.append(event)
+    results = [event for event in events if event.get("type") == "result"]
+    if not results:
+        raise json.JSONDecodeError("нет события result", stdout, 0)
+    tail = results[-1]
+    answered = [event for event in results if is_answer(event)]
+    if not answered or answered[-1] is tail:
+        return tail
+    final = dict(answered[-1])
+    costs = [
+        cost
+        for cost in (event.get("total_cost_usd") for event in results)
+        if isinstance(cost, (int, float))
+    ]
+    if costs:
+        final["total_cost_usd"] = max(costs)
+    final["trailing_result"] = {
+        key: tail.get(key) for key in ("subtype", "is_error", "total_cost_usd", "result")
+    }
+    return final
+
+
+def failed(data: dict) -> bool:
+    """Итог `claude -p` — сбой: `subtype` не `success` или `is_error` (отказ соединения приходит
+    как `success` с `is_error`, живой прогон #349). Одно правило для всех, кто читает итог."""
+    return data.get("subtype") != "success" or bool(data.get("is_error"))
+
+
+def trailing_warning(data: dict) -> str | None:
+    """Хвостовой ход после ответа по схеме кончился ошибкой — текст предупреждения, иначе None."""
+    tail = data.get("trailing_result")
+    if not isinstance(tail, dict) or not failed(tail):
+        return None
+    reason = (
+        "упёрся в предел --max-budget-usd"
+        if tail.get("subtype") == "error_max_budget_usd"
+        else f"завершился ошибкой (subtype {tail.get('subtype')}, is_error {tail.get('is_error')})"
+    )
+    return f"после ответа по схеме лишний ход модели {reason}: ответ принят"
+
+
+def check_result(data: dict, report: Path, budget: str, code: int, model: str = MODEL) -> dict:
+    """Прогон состоялся и дал ответ по схеме — `data`; иначе `ChildError`."""
+    cost = data.get("total_cost_usd", "?")
+    subtype = data.get("subtype")
+    if subtype == "error_max_budget_usd":
+        raise ChildError(
+            f"упёрлось в предел --max-budget-usd {budget} (потрачено {cost} USD, "
+            "subtype error_max_budget_usd): результат неполный, итога нет. "
+            f"Сырой результат — {report}. "
+            "Объём слишком велик для предела: разбить ветку или поднять предел решением владельца."
+        )
+    if failed(data):
+        raise ChildError(
+            f"завершилось ошибкой (subtype {subtype}, is_error {data.get('is_error')}, "
+            f"код {code}); сырой результат — {report}"
+        )
+    text = data.get("result") or ""
+    models = sorted(data.get("modelUsage") or {})
+    if not models:
+        # Сбой до модели (например, протухшая авторизация) приходит как subtype success
+        # с пустым modelUsage и текстом ошибки в result.
+        raise ChildError(
+            f"не дошло до модели (modelUsage пуст): {text.strip()[:500] or 'без текста'}; "
+            f"сырой результат — {report}"
+        )
+    if model not in models:
+        raise ChildError(
+            f"шло не на {model}: modelUsage — {', '.join(models)}; сырой результат — {report}"
+        )
+    if data.get("local_command") and not data.get("num_turns"):
+        # Так `/review` ведёт себя с `--output-format json` или без `CLAUDE_CODE_REPORT_FINDINGS=1`
+        # в окружении (#260): итог уходит мимо `claude -p`.
+        raise ChildError(
+            f"команда отработала локально (local_command {data['local_command']}, 0 ходов): "
+            "итог ушёл мимо claude -p, ответа по схеме нет (у /review так было при выводе json "
+            f"и без CLAUDE_CODE_REPORT_FINDINGS=1, #260); сырой результат — {report}"
+        )
+    if not isinstance(data.get("structured_output"), dict):
+        raise ChildError(
+            "нет ответа по схеме --json-schema (structured_output) — итог не распознан; "
+            f"сырой результат — {report}"
+        )
+    return data
