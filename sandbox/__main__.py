@@ -14,6 +14,7 @@ from sandbox.money import (
     order_total_kop,
 )
 from sandbox.money.rounding import round_rub_kop
+from sandbox.money.vat import vat_included_kop
 
 
 class OneLineErrorParser(argparse.ArgumentParser):
@@ -70,6 +71,11 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="итог до целого рубля, половина — вверх; минимум заказа и средняя — до округления",
     )
+    parser.add_argument(
+        "--vat",
+        action="store_true",
+        help="строкой «НДС 20 %%: X» — НДС, включённый в итог (после --round), в формате итога",
+    )
     parser.add_argument("--version", action=VersionAction, help="показать версию и выйти")
     args = parser.parse_args(argv)
     try:
@@ -99,6 +105,8 @@ def main(argv: list[str] | None = None) -> int:
         lines = [format_amount(total)]
         if avg is not None:
             lines.append(f"средняя цена: {format_amount(avg)}")
+        if args.vat:
+            lines.append(f"НДС 20 %: {format_amount(vat_included_kop(total))}")
         if args.count:
             lines.append(f"позиций: {qty}")
     except ValueError:

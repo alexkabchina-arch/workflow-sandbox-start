@@ -231,3 +231,33 @@ def test_without_package_metadata_cli_still_works(capsys, monkeypatch):
         importlib.reload(sandbox)
     assert main(["3x100"]) == 0
     assert capsys.readouterr().out == "300.00\u00a0₽\n"
+
+
+@pytest.mark.parametrize(
+    ("argv", "out"),
+    [
+        (["1x1000", "--vat"], "1 000.00 ₽\nНДС 20 %: 166.67 ₽\n"),
+        (["1x1000", "--vat", "--kop"], "100000\nНДС 20 %: 16667\n"),
+        (["1x1000", "--vat", "--code"], "1 000.00 RUB\nНДС 20 %: 166.67 RUB\n"),
+        # Порядок строк: итог, средняя цена, НДС, позиций
+        (
+            ["2x500", "--vat", "--avg", "--count"],
+            "1 000.00 ₽\nсредняя цена: 500.00 ₽\nНДС 20 %: 166.67 ₽\nпозиций: 2\n",
+        ),
+        # НДС — от округлённого итога: 332,41 → 332,00, НДС 55,33 (от 332,41 было бы 55,40)
+        (
+            ["3x100", "1x49.90", "--loyal", "--round", "--vat"],
+            "332.00 ₽\nНДС 20 %: 55.33 ₽\n",
+        ),
+    ],
+)
+def test_vat_flag_adds_vat_line(capsys, argv, out):
+    assert main(argv) == 0
+    assert capsys.readouterr().out == out
+
+
+def test_vat_flag_is_in_help(capsys):
+    with pytest.raises(SystemExit) as exc:
+        main(["--help"])
+    assert exc.value.code == 0
+    assert "--vat" in capsys.readouterr().out
