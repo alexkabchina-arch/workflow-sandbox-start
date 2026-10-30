@@ -16,6 +16,8 @@ from sandbox.money import (
 from sandbox.money.rounding import round_rub_kop
 from sandbox.money.vat import vat_included_kop
 
+VAT_RATE_PCT = 20
+
 
 class OneLineErrorParser(argparse.ArgumentParser):
     """Любая ошибка ввода — одна строка «sandbox: error: <причина>» и код 2, без usage."""
@@ -59,7 +61,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--count",
         action="store_true",
-        help="строкой после итога (и средней с --avg) «позиций: K», K — сумма количеств (штук)",
+        help="последней строкой (после итога, средней с --avg и НДС с --vat) «позиций: K», "
+        "K — сумма количеств (штук)",
     )
     parser.add_argument(
         "--avg",
@@ -74,7 +77,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--vat",
         action="store_true",
-        help="строкой «НДС 20 %%: X» — НДС, включённый в итог (после --round), в формате итога",
+        help=f"строкой «НДС {VAT_RATE_PCT} %%: X» после итога и средней, перед «позиций» — НДС, "
+        "включённый в итог (после --round), в формате итога",
     )
     parser.add_argument("--version", action=VersionAction, help="показать версию и выйти")
     args = parser.parse_args(argv)
@@ -83,10 +87,11 @@ def main(argv: list[str] | None = None) -> int:
         total = order_total_kop(items, args.discount, loyal=args.loyal)
         check_min_order(total)
         qty = total_qty(items)
-        # Средняя — цена единицы от неокруглённого итога: --round меняет только строку итога
+        # Средняя — цена единицы от неокруглённого итога; НДС — от итога после --round
         avg = avg_unit_price_kop(total, qty) if args.avg else None
         if args.round:
             total = round_rub_kop(total)
+        vat = vat_included_kop(total, VAT_RATE_PCT) if args.vat else None
     except ValueError as exc:
         parser.error(str(exc))
 
@@ -105,8 +110,8 @@ def main(argv: list[str] | None = None) -> int:
         lines = [format_amount(total)]
         if avg is not None:
             lines.append(f"средняя цена: {format_amount(avg)}")
-        if args.vat:
-            lines.append(f"НДС 20 %: {format_amount(vat_included_kop(total))}")
+        if vat is not None:
+            lines.append(f"НДС {VAT_RATE_PCT} %: {format_amount(vat)}")
         if args.count:
             lines.append(f"позиций: {qty}")
     except ValueError:

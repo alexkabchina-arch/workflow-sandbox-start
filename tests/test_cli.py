@@ -256,8 +256,9 @@ def test_vat_flag_adds_vat_line(capsys, argv, out):
     assert capsys.readouterr().out == out
 
 
-def test_vat_flag_is_in_help(capsys):
+def test_vat_flag_is_in_help(capsys, monkeypatch):
+    monkeypatch.setenv("COLUMNS", "200")  # справка флага — одной строкой
     with pytest.raises(SystemExit) as exc:
         main(["--help"])
     assert exc.value.code == 0
-    assert "--vat" in capsys.readouterr().out
+    assert "НДС, включённый в итог" in capsys.readouterr().out
