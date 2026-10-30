@@ -375,6 +375,9 @@ def main(argv: list[str] | None = None) -> int:
     # `--` перед промптом: вариадические флаги (`--allowedTools`, `--add-dir`) иначе съедят его.
     cmd += [*extra, "--", prompt]
     env = {**os.environ, "CANON_SESSION": plan["session"]}
+    env.pop(core.STARTED, None)
+    if not args.resume:  # старт сделан здесь: `/start N` внутри его не повторит (#452)
+        env[core.STARTED] = plan["session"]
     # Начало этого запуска для Stop-хука: `--resume` продолжает транскрипт прошлого, и отчёт об
     # остановке прошлого запуска иначе засчитался бы этому.
     env["CANON_RUN_STARTED"] = datetime.now(timezone.utc).isoformat(timespec="seconds")

@@ -1136,7 +1136,7 @@ def report(plan: dict, outside: bool) -> str:
         f"  сессия    CANON_SESSION={plan['session']}",
         f"  промпт    {plan['prompt']}",
         f"Запуск: cd {shlex.quote(plan['worktree'])} && CANON_SESSION={plan['session']} "
-        f"claude -- {shlex.quote(plan['prompt'])}",
+        f"{core.STARTED}={plan['session']} claude -- {shlex.quote(plan['prompt'])}",
     ]
     if outside:
         wt = shlex.quote(plan["worktree"])
@@ -1153,11 +1153,11 @@ def report(plan: dict, outside: bool) -> str:
             "работа из него (вход не удался — стоп: владельцу одной строкой «нужен клик входа в "
             "worktree тикета»); "
             + (
-                "промпт `/start N` — для новой сессии: старт уже сделан"
+                f"промпт `{plan['prompt']}` — для новой сессии"
                 if plan["kind"] == "ticket"
                 else "промпт — задание по PR, его набирает владелец"
             )
-            + "; «Запуск:» — для новой сессии из терминала"
+            + "; «Запуск:» — для новой сессии из терминала, старт в ней не повторяется"
         )
     return "\n".join(lines)
 

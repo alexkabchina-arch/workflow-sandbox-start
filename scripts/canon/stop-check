@@ -33,10 +33,11 @@
 Свой автор — участник репозитория или App (лицо агента, `canon.agentApp`): список и проверка — в
 `ticket_core.py`, общие с маршрутом и `session-start`.
 
-Иначе — `{"decision": "block", "reason": …}`: что не так и два законных выхода с командами. Так
-ловится и обрыв между push и отметкой. `stop_hook_active` не отпускает: страховка от бесконечной
-сессии — встроенный предел Claude Code (9 блокировок подряд, `CLAUDE_CODE_STOP_HOOK_BLOCK_CAP`),
-предел объёма `--max-budget-usd` и прерывание человеком.
+Иначе — `{"decision": "block", "reason": …}`: что не так и законные выходы с командами (два, у
+сессии тикета — три: ещё вопрос `ticket ask`). Так ловится и обрыв между push и отметкой.
+`stop_hook_active` не отпускает: страховка от бесконечной сессии — встроенный предел Claude Code
+(9 блокировок подряд, `CLAUDE_CODE_STOP_HOOK_BLOCK_CAP`), предел объёма `--max-budget-usd` и
+прерывание человеком.
 
 Собственная ошибка хука (не git-репозиторий, `gh` недоступен, неверная метка сессии, нет
 транскрипта для сверки времени отчёта, любое исключение) сессию **не держит**: код 0 и
@@ -272,7 +273,11 @@ class Session:
         # Вопрос `ticket ask` — конец и при открытом PR (вопрос на шагах `ticket ship`), как под
         # оркестратором (#452).
         if self.kind == "ticket" and self.waiting_question():
-            return None
+            return (
+                "вопрос задан, но есть незакоммиченные правки отслеживаемых файлов"
+                if dirty
+                else None
+            )
         pr = next((p for p in prs if p["state"] == "OPEN"), None)
         if pr is not None:
             return self.open_pr_problem(pr, head, dirty)
@@ -339,7 +344,8 @@ class Session:
                 f"`gh pr edit {self.number} --add-label {WAITING}`"
             )
         return (
-            f"Сессия {self.label} не закончена: {problem}. Законный конец — одно из двух. "
+            f"Сессия {self.label} не закончена: {problem}. Законный конец — одно из "
+            f"{'трёх' if self.kind == 'ticket' else 'двух'}. "
             "(1) Довести /ship по шагам `.claude/skills/ship/SKILL.md` — открытый PR ветки с "
             "отметкой review на запушенном head, без красного CI и с авто-мёржем; отметку "
             "`ship-finish` ставит только по отчёту полного ревью `scripts/canon/review`, чей head "
