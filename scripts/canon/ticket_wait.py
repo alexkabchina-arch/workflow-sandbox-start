@@ -204,10 +204,10 @@ class Wait:
         path = core.worktree_of(self.n)
         if not gone and path is not None and here and here.is_relative_to(path.resolve()):
             body = (
-                f"{line}. Сессия ещё в worktree тикета ({path}) — его не убрать из-под неё. Выйди: "
-                "ExitWorktree с action keep (в терминале, где сессия открыта в worktree, выйти "
-                "нельзя — передай владельцу итог, уборку сделает следующий старт). Затем вызов из "
-                "главного чекаута:"
+                f"{line}. Сессия ещё в worktree тикета ({path}) — его не убрать из-под неё. "
+                "Выйти нельзя (терминал, где сессия открыта в worktree) — передай владельцу итог, "
+                "уборку сделает следующий старт; вызов не нужен. Иначе выйди из рабочей копии, не "
+                "удаляя её (Claude Code — ExitWorktree с action keep), и вызов из главного чекаута:"
             )
             return (core.TURN, f"Тикет #{self.n}: слит, уборка", body, (self.again,))
         tail = "worktree и ветка убраны, главный чекаут догнан"
@@ -217,8 +217,9 @@ class Wait:
         if here is None:  # worktree сессии убрали раньше, чем дошла эта уборка
             body += (
                 f" Папки сессии больше нет — уборка шла из главного чекаута ({self.main}). "
-                "Выйди из неё: ExitWorktree с action keep (в терминале выйти нельзя — передай "
-                "владельцу итог); дальнейшие вызовы — из главного чекаута."
+                "Выйди из неё, ничего не удаляя (Claude Code — ExitWorktree с action keep); "
+                "дальнейшие вызовы — из главного чекаута. Выйти нельзя (терминал) — передай "
+                "владельцу итог."
             )
         return (core.DONE, f"Тикет #{self.n}: {line}", body, ())
 
