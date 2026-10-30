@@ -177,7 +177,7 @@ def session_mark() -> str | None:
     lock = Path(git("rev-parse", "--path-format=absolute", "--git-dir")) / SESSION_LOCK
     try:
         return lock.read_text(encoding="utf-8").strip() or None
-    except OSError:
+    except (OSError, ValueError):  # нечитаемый файл — не своя сессия: старт проверит сам
         return None
 
 

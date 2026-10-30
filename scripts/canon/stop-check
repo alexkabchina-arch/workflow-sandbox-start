@@ -161,6 +161,7 @@ class Session:
         self.kind, self.number = match.groups()
         self.core = core or load_core()
         self.orchestrated = self.core.orchestrated() and self.kind == "ticket"
+        self.open_pr = False
 
     def trusted(self, comment: dict) -> bool:
         """Свой автор; сбой сверки App — проверка не состоялась, а не «чужой» (сессию не держим)."""
@@ -271,6 +272,7 @@ class Session:
         if self.orchestrated:
             return self.orchestrated_problem(head, dirty, prs)
         pr = next((p for p in prs if p["state"] == "OPEN"), None)
+        self.open_pr = pr is not None  # вопрос `ticket ask` открытый PR не заменяет (`ask_hint`)
         if pr is not None:
             return self.open_pr_problem(pr, head, dirty)
         if any(p["state"] == "MERGED" and p["headRefOid"] == head for p in prs):
@@ -340,7 +342,7 @@ class Session:
             )
         return (
             f"Сессия {self.label} не закончена: {problem}. Законный конец — одно из "
-            f"{'трёх' if self.kind == 'ticket' else 'двух'}. "
+            f"{'трёх' if self.kind == 'ticket' and not self.open_pr else 'двух'}. "
             "(1) Довести /ship по шагам `.claude/skills/ship/SKILL.md` — открытый PR ветки с "
             "отметкой review на запушенном head, без красного CI и с авто-мёржем; отметку "
             "`ship-finish` ставит только по отчёту полного ревью `scripts/canon/review`, чей head "
@@ -354,7 +356,7 @@ class Session:
 
     def ask_hint(self) -> str:
         """Третий законный конец сессии тикета — вопрос владельцу (#452)."""
-        if self.kind != "ticket":
+        if self.kind != "ticket" or self.open_pr:
             return ""
         ask = self.core.command("ask", self.number)
         return (
