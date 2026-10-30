@@ -65,9 +65,10 @@
 5. Метка `in-progress` и исполнитель — я: после worktree и `setup`, чтобы сбой на них не оставил
    тикет занятым без сессии.
 
-Итог — путь worktree, метка сессии `CANON_SESSION` (её читает Stop-хук), промпт и строка «Запуск:»
-для новой сессии из терминала. Не из `session-run` и не изнутри worktree плана — ещё строка
-«Открытая сессия: войти в worktree — `EnterWorktree` с `path`…» и стопом, если вход не удался:
+Итог — путь worktree, метка сессии `CANON_SESSION` (её читает Stop-хук), промпт (тикет —
+`/start N`, #452) и строка «Запуск:» для новой сессии из терминала. Не из `session-run` и не
+изнутри worktree плана — ещё строка «Открытая сессия: войти в worktree — `EnterWorktree` с
+`path`…» и стопом, если вход не удался:
 без входа маршрут не идёт, `ticket ship` работает только из worktree тикета. Worktree вне
 `.claude/worktrees/` (заведён до режима В) — ещё с пометкой, что вход ждёт клика (`needs_click`
 плана); из другого worktree вход в `.claude/worktrees/` клика не ждёт (прогон #142). С `--json` —
@@ -137,7 +138,7 @@ QUEUED = "agent:queued"  # тикет в очереди оркестратора
 ORCHESTRATOR_STATE = "canon-orchestrator/state.json"  # своё состояние оркестратора
 RED = {"FAILURE", "ERROR", "TIMED_OUT", "CANCELLED", "ACTION_REQUIRED", "STARTUP_FAILURE"}
 # Замок сессии в личном каталоге git worktree: `session-run` держит его, пока идёт `claude`.
-SESSION_LOCK = "canon-session.lock"
+SESSION_LOCK = core.SESSION_LOCK
 SESSION_BRANCH = re.compile(r"^ticket-\d+(-.+)?$")
 PR_FIELDS = (
     "number,title,url,headRefName,headRefOid,baseRefName,isDraft,statusCheckRollup,"
@@ -242,11 +243,12 @@ def worktree_of(branch: str) -> Path | None:
 # --- замок сессии ---
 
 
-def take_lock(worktree: Path):
+def take_lock(worktree: Path, mark: str | None = None):
     """Замок сессии worktree — открытый файл под flock; None — его держит другой процесс.
 
     Файл — в личном каталоге git worktree. `session-run` держит замок, пока идёт `claude`;
-    снимается с концом процесса, в том числе аварийным.
+    снимается с концом процесса, в том числе аварийным. `mark` — метка своей сессии (#452,
+    `core.SESSION_MARK`): пишется в файл, пробы замка (`session_busy`) его не трогают.
     """
     git_dir = run("git", "-C", str(worktree), "rev-parse", "--path-format=absolute", "--git-dir")
     lock = open(Path(git_dir) / SESSION_LOCK, "a")  # noqa: SIM115 — держит вызывающий
@@ -255,6 +257,10 @@ def take_lock(worktree: Path):
     except BlockingIOError:
         lock.close()
         return None
+    if mark is not None:
+        lock.truncate(0)
+        lock.write(mark)
+        lock.flush()
     return lock
 
 
@@ -1096,7 +1102,7 @@ def start(number: int, claim=None, here: Path | None = None) -> dict:
                 "ticket": number,
                 "branch": branch,
                 "session": f"ticket-{number}",
-                "prompt": f"/implement #{number}, затем /ship",
+                "prompt": f"/start {number}",
             }
             worktree = ensure_worktree(main, branch, plan["session"], pending)
         else:

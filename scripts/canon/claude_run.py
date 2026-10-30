@@ -56,7 +56,7 @@ def load_roles():
 roles = load_roles()
 MODEL = "claude-opus-5-5"
 # Признак пути v2 — не дальше вызывающего скрипта: дочерний `claude` и его команды его не видят.
-SESSION_VARS = {"CANON_SESSION", "CANON_ENFORCE_STOP", roles.V2_ENV}
+SESSION_VARS = {"CANON_SESSION", "CANON_ENFORCE_STOP", "CANON_SESSION_MARK", roles.V2_ENV}
 DEFAULT_BASE = "origin/main"
 # Ревью Opus xhigh в разведке workflow#2 стоили 0,82–3,67 USD (в среднем 1,89); уточнить на пилоте.
 DEFAULT_BUDGET_USD = "10"
