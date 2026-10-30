@@ -26,6 +26,8 @@ SETTINGS_BASE = ".claude/settings.base.json"
 SETTINGS_PROJECT = ".claude/settings.project.json"
 # Блок владений тикета: `canon-sync` вписывает его в трекер проекта с профилем (#215).
 OWNERSHIP = ".claude/canon/ticket-ownership.md"
+# Блок v2 (#354): проекту на пути v2 `canon-sync` вписывает его вместо прежнего.
+OWNERSHIP_V2 = ".claude/canon/ticket-ownership-v2.md"
 PROFILE = "docs/agents/profile.md"
 TRACKER = "docs/agents/issue-tracker.md"
 
@@ -100,15 +102,18 @@ def check(root: Path) -> list[str]:
                     f"{SETTINGS}: не совпадает со склейкой {SETTINGS_BASE} + {SETTINGS_PROJECT}"
                 )
 
-    block = root / OWNERSHIP
-    if OWNERSHIP in lock["files"] and block.is_file() and (root / PROFILE).is_file():
+    # Блок в трекере — любой из поставленных: какой вписать, решает `canon-sync` по пути проекта.
+    blocks = [
+        rel for rel in (OWNERSHIP_V2, OWNERSHIP) if rel in lock["files"] and (root / rel).is_file()
+    ]
+    if blocks and (root / PROFILE).is_file():
         tracker = root / TRACKER
         text = tracker.read_bytes().decode(errors="replace") if tracker.is_file() else ""
         text = text.lstrip("﻿").replace("\r\n", "\n")
-        if text.count(block.read_text(encoding="utf-8")) != 1:
+        if not any(text.count((root / rel).read_text(encoding="utf-8")) == 1 for rel in blocks):
             problems.append(
-                f"{TRACKER}: блок владений не совпадает с {OWNERSHIP} (правлен, удалён или "
-                "файл переписан) — запустите canon-sync той же версии"
+                f"{TRACKER}: блок владений не совпадает с {' / '.join(blocks)} (правлен, удалён "
+                "или файл переписан) — запустите canon-sync той же версии"
             )
     return problems
 
