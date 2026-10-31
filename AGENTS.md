@@ -58,5 +58,6 @@
 
 ## Проект
 
+- Раздел «Процесс — канон» выше ставит и обновляет `canon-sync` — руками не править (его сверяет
+  `check_lock`); правила проекта — только в этом разделе.
 - Профиль проекта (команды, CI, критичные зоны, рецепт `/verify`) — [docs/agents/profile.md](docs/agents/profile.md).
-- Трекер и метки — [docs/agents/issue-tracker.md](docs/agents/issue-tracker.md), [docs/agents/triage-labels.md](docs/agents/triage-labels.md).
