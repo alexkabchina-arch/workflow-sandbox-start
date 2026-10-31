@@ -174,8 +174,8 @@ SCHEMA = {
             "type": "string",
             "description": "Обязательный вопрос: ослабляет ли дифф проверки (тесты, CI, "
             "обязательные проверки, ревью, хуки), права агента (разрешения и запреты настроек, "
-            "доступы), правила (CLAUDE.md и его импорты, в том числе .claude/canon/process.md, "
-            "AGENTS.md, скиллы, профиль, CODEOWNERS) или "
+            "доступы), правила (AGENTS.md с частью воркфлоу, .claude/canon/process.md, CLAUDE.md и "
+            "его импорты, скиллы, профиль, CODEOWNERS) или "
             "обезличивание данных? Ослабление — снять, отключить, сузить, сделать "
             "необязательным или обходимым; в CI (`.github/`) — ещё удалённые шаги или задачи "
             "тестов, `continue-on-error`, пропуск проверки условием `if:`. Нет — пустая "
@@ -363,6 +363,10 @@ V2_SKIP = (
 GITHUB_REPO = re.compile(r"github\.com[\w.-]*[:/]([^/\s]+/[^/\s]+?)(?:\.git)?/?$")
 MATT_LOCK = "matt-skills.lock.json"
 SKILLS_DIR = ".claude/skills/"
+# Файл правил (#454): `canon-sync` вписывает часть воркфлоу — файл под замком — в `AGENTS.md`
+# между метками; правка только этой части на файл тега — тоже чистая установка.
+AGENTS, PROCESS = "AGENTS.md", ".claude/canon/process.md"
+PROCESS_BEGIN, PROCESS_END = "<!-- canon:process", "<!-- /canon:process -->"
 COMMIT = re.compile(r"[0-9a-f]{40}")
 # Версия замка и пути, которые идут в системный промпт ревью: без них текст замка или имя файла
 # могли бы дать ревьюеру указание (версия замка `check_lock` не сверяет).
@@ -528,13 +532,30 @@ def v2_protected() -> bool:
     return False
 
 
+def rules_text(data: bytes) -> str:
+    """Текст файла правил без BOM и с `\\n` — как его сверяет `check_lock`."""
+    return data.decode(errors="replace").lstrip("﻿").replace("\r\n", "\n")
+
+
+def without_part(text: str) -> str | None:
+    """Текст, где строки части воркфлоу вместе с метками — одна строка-место (`\\0`): сравнение
+    видит и перенос части в другое место файла; меток не ровно одна пара — None."""
+    lines = text.split("\n")
+    marks = [line.strip() for line in lines]
+    begins = [i for i, mark in enumerate(marks) if mark.startswith(PROCESS_BEGIN)]
+    ends = [i for i, mark in enumerate(marks) if mark == PROCESS_END]
+    if len(begins) != 1 or len(ends) != 1 or begins[0] > ends[0]:
+        return None
+    return "\n".join(lines[: begins[0]] + ["\0"] + lines[ends[0] + 1 :])
+
+
 class Install:
     """Сверка замка `head` с тегом канона: файл под замком — blob дерева тега на GitHub.
 
     Блобы `git` сравниваются как есть: равный blob — тот же файл побайтно."""
 
     def __init__(self, base_sha: str, head: str):
-        self.head = head
+        self.head, self.base_sha = head, base_sha
         lock = read_lock(head)
         if lock is None:
             raise Unverified(f"нет {LOCK} в {head[:7]}")
@@ -681,6 +702,8 @@ class Install:
         return self.checked[rel]
 
     def check(self, rel: str) -> bool:
+        if rel == AGENTS:
+            return self.rules_ok()
         if self.self_mode and not rel.startswith(SELF_PREFIX):
             return False  # в каноне `--self` ставит только `.claude/` — прочее ревьюится
         data = self.content(rel)
@@ -696,6 +719,20 @@ class Install:
             return self.from_tag(rel)
         source = self.matt_source(rel)
         return source is not None and self.tree(*source[:2]).get(source[2]) == self.blob(rel)
+
+    def rules_ok(self) -> bool:
+        """`AGENTS.md` изменён только в части воркфлоу: часть — файл `.claude/canon/process.md`
+        под замком и тега, текст вне меток — как на основе. Перевод проекта (на основе файла нет)
+        — ревью."""
+        base = git_bytes("show", f"{self.base_sha}:{AGENTS}")
+        head = self.content(AGENTS)
+        if base is None or head is None or not self.verified(PROCESS):
+            return False
+        text = rules_text(head)
+        if text.count(rules_text(self.content(PROCESS) or b"")) != 1:
+            return False
+        outside = without_part(text)
+        return outside is not None and outside == without_part(rules_text(base))
 
     def dropped(self, rel: str) -> bool:
         """Файл убран тегом: был в старом замке, нет в новом, в `head` и в тег не входит — или

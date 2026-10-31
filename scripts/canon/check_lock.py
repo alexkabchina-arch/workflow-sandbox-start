@@ -30,6 +30,9 @@ OWNERSHIP = ".claude/canon/ticket-ownership.md"
 OWNERSHIP_V2 = ".claude/canon/ticket-ownership-v2.md"
 PROFILE = "docs/agents/profile.md"
 TRACKER = "docs/agents/issue-tracker.md"
+# Часть воркфлоу (#454): `canon-sync` вписывает её в `AGENTS.md`, `CLAUDE.md` — строка-ссылка.
+PROCESS = ".claude/canon/process.md"
+AGENTS, CLAUDE_MD, AGENTS_LINE = "AGENTS.md", "CLAUDE.md", "@AGENTS.md"
 
 
 class MergeError(Exception):
@@ -115,7 +118,29 @@ def check(root: Path) -> list[str]:
                 f"{TRACKER}: блок владений не совпадает с {' / '.join(blocks)} (правлен, удалён "
                 "или файл переписан) — запустите canon-sync той же версии"
             )
+
+    own = "scripts/canon/check_lock.py" not in lock["files"]  # сам канон: скрипты не вендорятся
+    if PROCESS in lock["files"] and (root / PROCESS).is_file() and not (own and old_layout(root)):
+        part = normalized(root / PROCESS)
+        if normalized(root / AGENTS).count(part) != 1:
+            problems.append(
+                f"{AGENTS}: часть воркфлоу не совпадает с {PROCESS} (правлена, удалена или файл "
+                "переписан) — запустите canon-sync той же версии"
+            )
     return problems
+
+
+def normalized(path: Path) -> str:
+    """Текст файла без BOM и с `\\n`; нет файла — пусто."""
+    text = path.read_bytes().decode(errors="replace") if path.is_file() else ""
+    return text.lstrip("﻿").replace("\r\n", "\n")
+
+
+def old_layout(root: Path) -> bool:
+    """Правила ещё в `CLAUDE.md` (нет `AGENTS.md`, `CLAUDE.md` — не ссылка на него): часть
+    воркфлоу сверять не с чем — так до перевода живёт сам канон (#455). Только ему: проект с
+    вендоренными скриптами откатом раскладки замок не обходит."""
+    return not (root / AGENTS).is_file() and normalized(root / CLAUDE_MD).strip() != AGENTS_LINE
 
 
 def main(argv: list[str]) -> int:
