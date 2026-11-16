@@ -316,6 +316,75 @@ def trusted(
     return _app_comments[key]
 
 
+# Отчёт об остановке узнаётся по началу (разметка заголовка впереди не мешает); сигнал перерасхода
+# `ship-finish` («ready-for-human: …») — служебный, не ответ.
+REPORT_HEAD = re.compile(r"^[#*\s]*" + REPORT_MARK)
+SIGNAL = "ready-for-human: "
+ANSWERS_SHOWN = 5
+
+
+def open_pr(branch: str) -> dict | None:
+    """Открытый PR ветки (номер, ссылка, черновик ли) или None."""
+    fields = ["--state", "open", "--json", "number,url,isDraft"]
+    prs = gh_json("pr", "list", "--head", branch, *fields) or []
+    return prs[0] if prs else None
+
+
+def after_report(n: int, branch: str, pr: dict | None | bool = True) -> list[dict]:
+    """Комментарии тикета и открытого PR ветки после последнего отчёта об остановке в каждом:
+    граница — сам отчёт, не часы машины. Где отчёта нет — оттуда ничего. Отчёт — только от
+    своих (`trusted`), как у Stop-хука и `session-start`: «Отчёт об остановке» постороннего
+    сдвинул бы границу за решение владельца (#249). Скрытый свой отчёт — тоже граница:
+    владелец прячет отработанный отчёт, а остановка от этого не раньше. Сбой сверки автора
+    — `Failure`: «не свой» молча пропустил бы ответ. `pr` — открытый PR ветки, если его уже
+    нашёл вызывающий (None — нет); по умолчанию — `open_pr`."""
+    if pr is True:
+        pr = open_pr(branch)
+    sources = [("issue", str(n))] + ([("pr", str(pr["number"]))] if pr else [])
+    found = []
+    for kind, ref in sources:
+        said = (gh_json(kind, "view", ref, "--json", "comments") or {}).get("comments") or []
+        at = next(
+            (
+                i
+                for i in reversed(range(len(said)))
+                if REPORT_HEAD.match(said[i].get("body") or "") and trusted(said[i], strict=True)
+            ),
+            None,
+        )
+        if at is not None:
+            found += said[at + 1 :]
+    return found
+
+
+def report_answers(comments: list[dict]) -> list[dict]:
+    """Ответы владельца на отчёт об остановке среди комментариев после него (#459, слабое
+    место 8): участник репозитория, не скрытый; не служебный маршрута и не сигнал
+    перерасхода — кроме ответа из чата, переданного сессией (`REPLY_MARK`): он тоже голос
+    владельца. App (сессия, оркестратор) — свой, но не ответ (#214). По времени."""
+    found = []
+    for c in sorted(comments, key=lambda c: c.get("createdAt") or ""):
+        body = (c.get("body") or "").strip()
+        if c.get("isMinimized") or not member(c) or not body:
+            continue
+        if REPLY_MARK in body or (is_answer(body) and not body.startswith(SIGNAL)):
+            found.append(c)
+    return found
+
+
+def quoted_answers(answers: list[dict]) -> str:
+    """Ответы цитатой со ссылкой — последние `ANSWERS_SHOWN`: строка ответа не станет командой
+    задания."""
+    shown = answers[-ANSWERS_SHOWN:]
+    parts = [
+        f"{c.get('url') or 'комментарий'}:\n{quote(c['body'].replace(REPLY_MARK, '').strip())}"
+        for c in shown
+    ]
+    if len(answers) > len(shown):
+        parts.append(f"(ранних ответов не показано: {len(answers) - len(shown)})")
+    return "\n\n".join(parts)
+
+
 def keep(st, path: Path, name: str) -> None:
     """Файл ответа агента — в каталог состояния `st`: в worktree он не повторится на новом круге."""
     if path.exists():
@@ -326,7 +395,7 @@ def keep(st, path: Path, name: str) -> None:
 def relay_reply(number: int, reply: str) -> str:
     """Ответ владельца из чата (`.ticket/reply.md`) — комментарием в тикет; ссылка на него (`gh`
     её печатает) или «тикет #N»."""
-    body = f"{REPLY_MARK}\n**Ответ владельца из чата** (передан сессией)\n\n{reply}"
+    body = f"{REPLY_MARK}\n**Ответ владельца из чата** (передан сессией)\n\n{mask(reply)}"
     posted = gh("issue", "comment", str(number), "--body", body)
     return posted.splitlines()[0] if posted else f"тикет #{number}"
 
@@ -653,12 +722,119 @@ def without_secret_fields(text: str) -> str:
     return "\n".join(kept)
 
 
+# Маска секретов в тексте для GitHub (#446; #287 п. 5, #294 п. 3) — общая для отчёта об остановке
+# и вопроса владельцу. Пароль в адресе — при любом символе перед схемой (`DB_URL_postgresql://…`,
+# `Ошибкаpostgresql://…`) и при `@` в логине: пароль — до последнего `@` слова (в нём бывают `/`
+# и `@`; лишнее под маской не вредит). Схема начинается не внутри схемы (`(?<!…)`): иначе длинное
+# слово без `://` проверялось бы с каждой буквы — квадратичное время на длинной строке лога.
+URL_PASSWORD = re.compile(r"(?<![A-Za-z0-9+.-])([A-Za-z][A-Za-z0-9+.-]*://[^\s/:]*:)\S+(@)")
+# Запись `ИМЯ: значение`, `ИМЯ=значение`, `"имя": "значение"` с именем секрета; значение — в
+# кавычках целиком (с пробелами) или до пробела, со схемой `Bearer`/`Basic`/`Token` впереди.
+# Значение — в просмотре вперёд: запись с несекретным именем (`Error: GH_TOKEN=…`) его не
+# забирает, и секретная запись внутри найдётся. Имя — не продолжение слова и не часть пути
+# (`config/token.py:12` — файл и строка, а не запись).
+SECRET_RECORD = re.compile(
+    r"""(?<![A-Za-z0-9_.\-/])(["']?)([A-Za-z_][A-Za-z0-9_.-]*)\1[ \t]*[:=][ \t]*"""
+    r"""(?=("[^"\n]*"|'[^'\n]*'|(?:(?:Bearer|Basic|Token)[ \t]+)?[^\s"',;&]+))""",
+    re.I,
+)
+# Имя секрета: слово внутри имени (`PGPASSWORD`, `GH_TOKEN`; не `tokens`) или часть имени между
+# `_`, `-`, `.` (`api_key`, `KEY`, но не `monkey`, не `author`, не `pass`/`auth` итогов тестов).
+SECRET_WORDS = re.compile(
+    r"token(?!s)|secret|passw(?:or)?d|credential|authorization|dsn|apikey", re.I
+)
+SECRET_PARTS = frozenset({"key", "pwd", "pw", "cookie"})
+# Короткое число у имени `key` (`key: 3`) — итог, а не секрет; прочие числа (`DB_PWD=123456`,
+# `api_key=12345678`) — секрет. Файл и строка (`token.py:12`) — не запись.
+SMALL = re.compile(r"^\d{1,4}[).\]]*$")
+FILE_LINE = re.compile(r"\.[A-Za-z0-9]+$")
+# Токен после `Bearer`/`Basic` — похожий на токен: с цифрой, заглавной внутри или длинный
+# (`Basic dXNlcjpwYXNz` — да, `Basic functionality` — нет).
+BEARER = re.compile(r"\b(Bearer|Basic)([ \t]+)([A-Za-z0-9._~+/=-]{6,})", re.I)
+MASK = "***"
+
+
+def secret_name(name: str) -> bool:
+    return bool(SECRET_WORDS.search(name)) or any(
+        part.lower() in SECRET_PARTS for part in re.split(r"[_.-]", name)
+    )
+
+
+def mask(text: str) -> str:
+    """Текст без паролей и токенов: пароль в адресе, значения записей с именем секрета, токен
+    после `Bearer`/`Basic` — `***`. Строки без секретов не меняются."""
+    text = URL_PASSWORD.sub(rf"\1{MASK}\2", text)
+    hidden: list[tuple[int, int]] = []
+    for m in SECRET_RECORD.finditer(text):
+        name, value = m.group(2), m.group(3)
+        start = m.end()
+        if not secret_name(name) or value == MASK or (hidden and start < hidden[-1][1]):
+            continue
+        if SMALL.match(value) and (name.lower() == "key" or FILE_LINE.search(name)):
+            continue
+        hidden.append((start, start + len(value)))
+    for start, end in reversed(hidden):
+        text = text[:start] + MASK + text[end:]
+
+    def bearer(m: re.Match) -> str:
+        token = m.group(3)
+        if not re.search(r"\d|.[A-Z]", token) and len(token) < 20:
+            return m.group(0)
+        return f"{m.group(1)}{m.group(2)}{MASK}"
+
+    return BEARER.sub(bearer, text)
+
+
 def secrets_command(text: str | None, profile) -> list[str] | None:
     """Команда проверки `secrets` из текста профиля (#258); профиля или блока `checks` нет — None.
     Строка блока не разобрана — `Failure`: защитная проверка из-за опечатки не открывается молча."""
     if text is None or not CHECKS_BLOCK.search(text):
         return None
     return dict(parse_checks(text, profile)).get("secrets")
+
+
+SECRETS = "secrets"
+MAIN = "origin/main"
+
+
+def main_text(path, cwd: Path | None = None) -> str | None:
+    """Файл `path` (от корня) из основной ветки `origin/main`, а не из ветки тикета (#459): ветка
+    не уберёт проверку секретов из профиля и не поменяет её команду. Файла нет — None; нет
+    самой `origin/main` — `Failure`: «нет проверки» молча открыло бы push."""
+    if run("git", "rev-parse", "--verify", "-q", MAIN, cwd=cwd).returncode != 0:
+        raise Failure(f"нет {MAIN} — профиль основной ветки не прочитать (git fetch)")
+    listed = git("ls-tree", "--name-only", MAIN, "--", str(path), cwd=cwd)
+    if not listed:
+        return None
+    return git("show", f"{MAIN}:{path}", cwd=cwd) + "\n"
+
+
+def secrets_line(text: str | None, profile, block: str) -> list[str] | None:
+    """Команда `secrets` блока `block` (`checks` или `fast-checks`) текста профиля; нет — None."""
+    if text is None:
+        return None
+    if block == "fast-checks":
+        return dict(fast_checks(text, profile) or []).get(SECRETS)
+    return secrets_command(text, profile)
+
+
+def trusted_secrets(root: Path, profile, block: str = "checks") -> tuple[list[str] | None, str]:
+    """Команда `secrets` блока `block` и откуда она (#459): из профиля основной ветки
+    `origin/main` — ветка её не уберёт и не подменит («main»); там её нет — из профиля ветки
+    («branch»): ветка, которая проверку добавляет, — не тупик, и проверка лучше, чем никакой;
+    нет нигде — (None, «main», если профиль в основной ветке есть, иначе «»: первая установка
+    воркфлоу, профиль приносит сам PR). Политика одна для хука, допуска и `ship-finish`. Нет
+    `origin/main` или строка блока не разобрана — `Failure`."""
+    main = main_text(profile, root)
+    if (command := secrets_line(main, profile, block)) is not None:
+        return command, "main"
+    try:
+        own = (root / profile).read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        own = None
+    if (command := secrets_line(own, profile, block)) is not None:
+        return command, "branch"
+    return None, "main" if main is not None else ""
 
 
 def canon_secrets(argv: list[str], here: Path) -> list[str]:

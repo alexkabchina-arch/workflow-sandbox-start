@@ -17,9 +17,22 @@
    его смотрят и добавляют (`git add`), затем коммит повторяют. Красные идут все; хоть одна —
    коммита нет, причина — имя, команда, код и конец вывода (у `secrets` — только «файл:строка»,
    без значения).
+   Строка `secrets` — из профиля основной ветки `origin/main`, не из рабочей копии (#459): ветка
+   не уберёт её и не подменит команду; там её нет — строка ветки (`trusted_secrets`).
+   Строка `gitleaks` идёт с настройками основной ветки —
+   конфиг `.gitleaks.toml` из `origin/main`, без `.gitleaksignore` и `gitleaks:allow` ветки, у
+   подкоманды `git` источник — каталог git рабочей копии (`secrets.trusted_settings`); помощник
+   канона `scripts/canon/secrets` — копией рядом; прочие команды идут как написаны (команда,
+   что запускает файл рабочей копии или gitleaks с источником `.`, остаётся во власти ветки —
+   профили воркфлоу и шаблона так не пишут). Строки `secrets` нет нигде, а в основной ветке блок
+   есть, — коммита нет (и подготовка — стоп). Находка — не «почини»: вопрос владельцу отчётом об
+   остановке (`.ticket/stop.md`, затем `ticket ship N`), без чистки и глушения; сбой самой
+   проверки (нет программы, настройки не собраны) — обычная причина.
 3. Коммит слияния (`MERGE_HEAD`, догон основы) — те же проверки, но `{files}` — файлы, отличные
    от обоих родителей: разрешённые конфликты и свои правки в коммите слияния (`conflict_files`);
-   команда без `{files}` идёт как написана. Конфликтов не
+   команда без `{files}` идёт как написана; у `gitleaks` — находки только в этих файлах (решение
+   владельца 30.10, п. 1: «коммит слияния — по файлам конфликта»; `--staged` видит весь влитой
+   дифф `main`, а его код проверен своим путём). Конфликтов не
    было — git зовёт не `pre-commit`, а `pre-merge-commit`: быстрые проверки пропускаются (код
    обеих сторон уже проверен), сверка части воркфлоу (шаг 1) идёт.
 4. Свой хук проекта того же вида (`core.hooksPath` общего конфига, например husky, иначе `hooks/`
@@ -58,6 +71,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import types
 from pathlib import Path
 
@@ -228,9 +242,13 @@ def prepare(worktree: Path) -> tuple[bool, str]:
         return False, f"хук перед коммитом не поставлен — {why}"
     if why := installed(worktree):
         return False, f"хук перед коммитом не стоит — {why}"
-    checks, broken = listed(worktree, load("ticket_core.py"))
+    ticket_core = load("ticket_core.py")
+    checks, broken = listed(worktree, ticket_core)
     if broken:
         return False, f"хук перед коммитом: список быстрых проверок не разобран — {broken}"
+    checks, problem = with_main_secrets(worktree, checks, ticket_core)
+    if problem:
+        return False, f"хук перед коммитом: {problem}"
     if checks is None:
         return True, (
             f"хук перед коммитом поставлен, но в {PROFILE} нет блока ```fast-checks — формат, "
@@ -389,6 +407,80 @@ def reason(name: str, command: list[str], code: int, output: str, ticket_core) -
     return "\n".join([head, *(f"  {line}" for line in lines)])
 
 
+def with_main_secrets(worktree: Path, checks: list | None, ticket_core) -> tuple[list | None, str]:
+    """Строка `secrets` быстрых проверок — из профиля основной ветки `origin/main`, а не из
+    рабочей копии (#459): ветка не уберёт проверку и не подменит её команду. Там её нет — строка
+    ветки (`ticket_core.trusted_secrets`, одна политика с допуском и `ship-finish`): ветка,
+    которая проверку вводит, не тупик. Нет нигде, а в основной ветке блок ```fast-checks есть, —
+    причина отказа коммиту; блока нет и там — секретов в хуке нет (подготовка предупреждает о
+    блоке). Итог — список проверок и причина (пусто — нет)."""
+    own = None if checks is None else [(n, a) for n, a in checks if n != SECRETS]
+    try:
+        command, where = ticket_core.trusted_secrets(worktree, PROFILE, "fast-checks")
+        main = ticket_core.main_text(PROFILE, worktree) if command is None and where else None
+        block = main is not None and ticket_core.fast_checks(main, PROFILE) is not None
+    except (ticket_core.Failure, ValueError) as exc:
+        return own, f"проверка секретов: профиль основной ветки не прочитан — {exc}"
+    if command is not None:
+        return [*(own or []), (SECRETS, command)], ""
+    if block:
+        return own, (
+            f"в {PROFILE} нет строки `secrets` блока ```fast-checks — ни в основной ветке "
+            "(origin/main), ни в ветке: коммит без проверки секретов не идёт; строку дописать в "
+            "профиль ветки (образец — шаблон профиля воркфлоу)"
+        )
+    return own, ""
+
+
+def run_secrets(command: list[str], worktree: Path, files: list[str], merging: bool, ticket_core):
+    """Проверка секретов (#459): строка `gitleaks` — с настройками основной ветки (конфиг из
+    `origin/main`, без `.gitleaksignore` и `gitleaks:allow` ветки; у подкоманды `git` источник —
+    каталог git рабочей копии), как у помощника `secrets`; помощник канона — копией рядом. На
+    коммите слияния находки — только в файлах конфликта: прочее — влитой код `main`, его
+    проверил свой путь (`gitleaks --staged` видит весь влитой дифф). Итог — код и вывод."""
+    if Path(command[0]).name != "gitleaks":
+        return run(ticket_core.canon_secrets(command, CANON), worktree)
+    helper = load("secrets")
+    with tempfile.TemporaryDirectory(prefix="canon-hook-secrets-") as tmp:
+        try:
+            flags, gitdir = helper.trusted_settings(Path(tmp), cwd=worktree)
+        except helper.SettingsError as exc:
+            return 1, f"настройки gitleaks основной ветки не собраны: {exc}"
+        argv = [*command, *flags]
+        report = Path(tmp) / "report.json"
+        if merging:
+            argv += ["--report-format", "json", "--report-path", str(report)]
+        if command[1:2] == ["git"]:
+            argv.append(gitdir)
+        code, output = run(argv, worktree)
+        if merging and code != 0:
+            code, output = conflict_findings(report, files, code, output)
+    return code, output
+
+
+def conflict_findings(report: Path, files: list[str], code: int, output: str) -> tuple[int, str]:
+    """Находки отчёта gitleaks (JSON) только в `files`: нет — проверка зелёная; есть — вывод в
+    виде `gitleaks -v` (поля без значения) для причины. Отчёт не прочитан — как было."""
+    try:
+        found = json.loads(report.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return code, output
+    if not isinstance(found, list):
+        return code, output
+    mine = [f for f in found if isinstance(f, dict) and f.get("File") in files]
+    if not mine:
+        return 0, ""
+    lines = []
+    for f in mine:
+        lines += [
+            f"RuleID: {f.get('RuleID', '?')}",
+            f"File: {f.get('File')}",
+            f"Line: {f.get('StartLine', '?')}",
+            f"Fingerprint: {f.get('Fingerprint', '')}",
+        ]
+    return code, "\n".join(lines)
+
+
 def hook(worktree: Path) -> int:
     """Стандартные проверки коммита: 0 — коммит идёт, 1 — остановлен; причина — в stderr."""
     failed = process_part(worktree)
@@ -396,7 +488,11 @@ def hook(worktree: Path) -> int:
     checks, broken = listed(worktree, ticket_core)
     if broken:
         return stop([*failed, f"список быстрых проверок не разобран: {broken}"])
-    if git(worktree, "rev-parse", "-q", "--verify", "MERGE_HEAD").returncode == 0:
+    checks, problem = with_main_secrets(worktree, checks, ticket_core)
+    if problem:
+        failed.append(problem)
+    merging = git(worktree, "rev-parse", "-q", "--verify", "MERGE_HEAD").returncode == 0
+    if merging:
         files = conflict_files(worktree)
         if not files:
             checks = []  # слияние без конфликтов: код обеих сторон уже проверен
@@ -410,18 +506,41 @@ def hook(worktree: Path) -> int:
         command = expand(listed_command, files)
         if command is None:
             continue
-        code, output = run(command, worktree)
+        if name == SECRETS:
+            code, output = run_secrets(command, worktree, files, merging, ticket_core)
+        else:
+            code, output = run(command, worktree)
         after = snapshot(worktree, files)
         edited = edited_files(before, after)
         before = after  # снимок «после» — «до» следующей проверки
         if code != 0:
             failed.append(reason(name, command, code, output, ticket_core))
+            if name == SECRETS and ticket_core.secret_findings(output):  # не сбой проверки
+                failed.append(secrets_stop(worktree, ticket_core))
         elif edited:
             failed.append(
                 f"проверка «{name}» ({' '.join(command)}) исправила файлы: {', '.join(edited)} — "
                 "посмотри правку, добавь её в коммит (git add) и повтори коммит"
             )
     return stop(failed) if failed else 0
+
+
+def secrets_stop(worktree: Path, ticket_core) -> str:
+    """Что делать с красной проверкой секретов (#459, слабое место 7): не «почини», а вопрос
+    владельцу отчётом об остановке маршрута."""
+    branch = git(worktree, "symbolic-ref", "-q", "--short", "HEAD").stdout.strip()
+    n = ticket_core.ticket_of(branch)
+    then = (
+        f"затем `{ticket_core.command('ship', n)}`: маршрут опубликует отчёт без отправки ветки"
+        if n is not None
+        else "затем передай вопрос владельцу"
+    )
+    return (
+        "Секрет — не чинить и не глушить: не убирать строку ради проверки, не `.gitleaksignore`, "
+        "не `gitleaks:allow`, не правка `.gitleaks.toml` или профиля, не `--no-verify`. Вопрос "
+        "владельцу — ключ настоящий (отзывает владелец) или ложная тревога (правило в основной "
+        f"ветке правит владелец) — в `.ticket/stop.md`, {then} (docs/secrets.md воркфлоу)."
+    )
 
 
 def stop(problems: list[str]) -> int:
