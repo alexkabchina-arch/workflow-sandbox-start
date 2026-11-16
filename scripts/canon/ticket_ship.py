@@ -12,7 +12,7 @@
 | ревью ошибок | `review`, отчёт рядом с состоянием; «только документы» — без разбора | — |
 | разбор | находки и правило разбора | решения, исправления (`findings.md`) |
 | проверка разбора | все разобраны; тикеты техдолга и канона — сам | ответ владельца (`answer.md`) |
-| тесты и линтеры | блок `checks` профиля через `run-log` | починка (`checks.md`) |
+| тесты и линтеры | блок `checks` через `run-log`, `{files}` — файлы ветки | починка (`checks.md`) |
 | `/verify` | критерии из тикета и его комментариев, `verify`, итог | FAIL — починить |
 | догон базы | `git merge origin/main` | конфликт — разрешить (`sync.md`) |
 | тело PR | факты: Closes, тесты, ревью, `/verify`, догон | «Что сделано» (`summary.md`) |
@@ -43,6 +43,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import re
 import sys
 import tempfile
@@ -280,6 +281,21 @@ address_comments true) — без вопроса; событие CI разбуд
 
 WAIT = """Затем ожидание мёржа и уборка — сессия ждёт сама, до 20 минут ({long}); итог ожидания
 передать владельцу вместе с итогом выше:"""
+
+
+def selected(path: Path) -> dict | None:
+    """Отбор задетых тестов, записанный командой проверки (`files`, `tests`); нет или испорчен —
+    None: промахи такой проверки не ловятся."""
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    files, tests = data.get("files"), data.get("tests")
+    if not all(isinstance(x, list) and all(isinstance(i, str) for i in x) for x in (files, tests)):
+        return None
+    return {"files": files, "tests": tests}
 
 
 def load_review() -> types.ModuleType:
@@ -1011,18 +1027,36 @@ class Route:
             st.go("verify")
             return None
         docs_since = bool(green) and self.docs_only_since(green["head"])
-        results = []
+        results, files = [], None
         for name, argv in core.profile_checks(self.root / PROFILE):
             if docs_since and name == "tests":
                 note = f"не повторялся: после `{green['head'][:7]}` — только документы"
-                results.append({"name": name, "code": 0, "note": note})
+                kept = {"name": name, "code": 0, "note": note}
+                # Отбор прошлого прогона — дальше: по нему `ticket wait` ловит промах (#464).
+                prior = next((r for r in green["results"] if r["name"] == name), {})
+                if prior.get("selected"):
+                    kept["selected"] = prior["selected"]
+                results.append(kept)
                 continue
+            if any(core.FILES_ARG.match(a) for a in argv):  # задетые тесты и т.п. (#464)
+                files = core.branch_files() if files is None else files
+                argv = core.expand_files(argv, files)
+                if argv is None:
+                    note = "пропущена: подходящих изменённых файлов нет"
+                    results.append({"name": name, "code": 0, "note": note})
+                    continue
             core.say(f"ticket: {name} …")
             if name == "secrets":  # помощник — копия рядом, а не файл ветки (#283)
                 argv = core.canon_secrets(argv, core.HERE)
             if Path(argv[0]).name != "run-log":
                 argv = [sys.executable, str(core.HERE / "run-log"), "-l", name, "--", *argv]
-            res = core.run(*argv, cwd=self.root)
+            # Отбор задетых тестов команда пишет сюда: по нему `ticket wait` ловит промах (#464).
+            st.dir.mkdir(parents=True, exist_ok=True)
+            picked = st.dir / f"affected-{re.sub(r'[^A-Za-z0-9_-]+', '-', name)}.json"
+            picked.unlink(missing_ok=True)
+            env = {**os.environ, core.AFFECTED_OUT: str(picked)}
+            res = core.run(*argv, cwd=self.root, env=env)
+            selection = selected(picked)
             log = re.search(r"лог: (\S+)", res.stdout)
             output = res.stdout + res.stderr
             if res.returncode != 0 and log:  # строка ошибки — из полного лога, не из хвоста
@@ -1039,6 +1073,7 @@ class Route:
                     "log": log.group(1) if log else None,
                     "tail": tail(hide(res.stdout + res.stderr), 30),
                     "error": first_error(hide(output)),
+                    **({"selected": selection} if selection is not None else {}),
                 }
             )
         st["checks_run"] = {"head": current, "results": [self.brief(r) for r in results]}

@@ -1,0 +1,328 @@
+#!/usr/bin/env python3
+"""affected-tests — задетые тесты: отбор по изменённым файлам и прогон отобранных (#464).
+
+    python3 scripts/canon/affected-tests [ФАЙЛ…]           # отбор и прогон
+    python3 scripts/canon/affected-tests --list [ФАЙЛ…]    # только отбор, по строке на тест
+
+Из корня рабочей копии. Файлы — изменённые файлы ветки: шаг маршрута «тесты и линтеры»
+(`ticket ship`) и проверка в песочнице пути v2 подставляют их на место `{files}` в строке
+`tests` блока ```checks профиля (`tests: python3 scripts/canon/affected-tests {files}`).
+Настройки — блок ```affected-tests профиля (`docs/agents/profile.md`), строки `ключ: значение`:
+
+- `tests` — где тесты, шаблоны через пробел (по умолчанию `tests/**/test*.py`);
+- `sources` — каталоги кода, внутри которых ищутся импорты, через пробел; не задано — каталог
+  самого изменённого файла;
+- `slow` — медленные тесты, шаблоны через пробел: идут, только когда изменён сам тест или его
+  «свой» файл (имя теста без `test_` — имя файла, `-` и `_` не различаются); иначе их гоняет CI;
+- `limit` — предел времени прогона отобранных, секунд; превышен — прогон остановлен, код 124;
+- `run` — команда прогона (без оболочки), отобранные тесты — её аргументами в конце.
+
+Отбор — общий, по именам и импортам (так же отбирают местные ворота самого воркфлоу,
+`ship-finish`): тест идёт, если он сам изменён или упоминает имя изменённого файла (у файла
+кода — имя без расширения, у прочих — с ним) или имя файла, который упоминает изменённый модуль
+(импорт: путь модуля от каталога `sources` без расширения). Отобранного нет — код 0 без
+прогона. Проект может заменить отбор своим: своя команда в строке `tests` с теми же `{files}`.
+
+Отбор записывается файлом JSON (`files`, `tests`), если задан `CANON_AFFECTED_OUT`: по нему
+`ticket wait` узнаёт промах — CI упал на тесте вне отбора (`docs/affected-tests.md` канона).
+Своя команда проекта может писать тот же файл; не пишет — промахи не ловятся.
+Код выхода: код команды `run`; 2 — ошибка настроек, 124 — превышен `limit`.
+Файл вендорится из канона `alexkabchina-arch/workflow`: руками не править.
+Только стандартная библиотека Python 3.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import re
+import shlex
+import signal
+import subprocess
+import sys
+from pathlib import Path, PurePosixPath
+
+PROFILE = Path("docs/agents/profile.md")
+BLOCK = re.compile(r"^```affected-tests[ \t]*\n(.*?)^```", re.M | re.S)
+KEYS = ("tests", "sources", "slow", "limit", "run")
+DEFAULT_TESTS = ("tests/**/test*.py",)
+OUT_ENV = "CANON_AFFECTED_OUT"
+TIMEOUT_CODE = 124
+# Файл кода — по имени без расширения: так его называет импорт (`import calc`, `from './calc'`).
+CODE = {
+    ".py", ".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx", ".vue", ".svelte", ".go", ".rb", ".rs",
+    ".java", ".kt", ".swift", ".php", ".cs",
+}  # fmt: skip
+SCAN_LIMIT = 2**20  # файл больше — в поиске импортов не читается
+
+
+class SettingsError(Exception):
+    pass
+
+
+def parse(text: str | None) -> dict:
+    """Настройки из блока ```affected-tests; блока нет — по умолчанию. Строка не `ключ: значение`
+    или ключ незнакомый — `SettingsError`."""
+    conf = {"tests": list(DEFAULT_TESTS), "sources": [], "slow": [], "limit": None, "run": []}
+    block = BLOCK.search(text or "")
+    if not block:
+        return conf
+    for raw in block.group(1).splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        key, sep, value = line.partition(":")
+        key, value = key.strip(), value.strip()
+        if not sep or key not in KEYS:
+            raise SettingsError(
+                f"блок ```affected-tests: строка «{line}» — нужна `ключ: значение`, ключи: "
+                f"{', '.join(KEYS)}"
+            )
+        try:
+            words = shlex.split(value)
+        except ValueError as exc:
+            raise SettingsError(f"блок ```affected-tests, `{key}`: {exc}") from None
+        if any(w.startswith("<") or w.endswith(">") for w in words):
+            raise SettingsError(
+                f"блок ```affected-tests, `{key}`: заглушка шаблона не заполнена — «{value}»"
+            )
+        if key == "limit":
+            try:
+                conf["limit"] = float(value)
+            except ValueError:
+                raise SettingsError(
+                    f"блок ```affected-tests: `limit` — секунды, а не «{value}»"
+                ) from None
+            if conf["limit"] <= 0:
+                raise SettingsError("блок ```affected-tests: `limit` — больше нуля")
+        else:
+            conf[key] = [w.rstrip("/") if key == "sources" else w for w in words]
+    return conf
+
+
+def read_settings(root: Path, profile: Path = PROFILE) -> dict:
+    try:
+        text = (root / profile).read_text(encoding="utf-8")
+    except OSError:
+        text = None
+    return parse(text)
+
+
+def pattern_re(pattern: str) -> re.Pattern:
+    """Шаблон пути как у git: `*` и `?` — внутри одного каталога, `**/` — любые каталоги, в том
+    числе ни одного."""
+    out, i = [], 0
+    while i < len(pattern):
+        if pattern.startswith("**/", i):
+            out.append("(?:[^/]+/)*")
+            i += 3
+        elif pattern.startswith("**", i):
+            out.append(".*")
+            i += 2
+        elif pattern[i] == "*":
+            out.append("[^/]*")
+            i += 1
+        elif pattern[i] == "?":
+            out.append("[^/]")
+            i += 1
+        else:
+            out.append(re.escape(pattern[i]))
+            i += 1
+    return re.compile("".join(out) + r"\Z")
+
+
+def matches(path: str, patterns: list[str]) -> bool:
+    return any(pattern_re(p).match(path) for p in patterns)
+
+
+def name_of(path: PurePosixPath) -> str:
+    """Имя, по которому файл упоминают: у кода — без расширения, у прочих — целиком."""
+    return path.stem if path.suffix in CODE else path.name
+
+
+def plain(name: str) -> str:
+    return name.lower().replace("-", "_")
+
+
+def tracked(root: Path) -> list[str]:
+    """Файлы рабочей копии из git (неотслеживаемые не участвуют). Сбой git — `SettingsError`:
+    пустой список выглядел бы зелёным «задетых тестов нет»."""
+    res = subprocess.run(
+        ["git", "ls-files", "-z"], cwd=root, capture_output=True, text=True, check=False
+    )
+    if res.returncode != 0:
+        raise SettingsError(f"git ls-files: {(res.stderr or res.stdout).strip()}")
+    return [p for p in res.stdout.split("\0") if p]
+
+
+def read(root: Path, rel: str) -> str:
+    path = root / rel
+    try:
+        if path.stat().st_size > SCAN_LIMIT:
+            return ""
+        return path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return ""
+
+
+def import_keys(changed: list[PurePosixPath], sources: list[str]) -> dict[PurePosixPath, set]:
+    """Ключи импорта изменённых модулей по каталогам поиска: путь модуля от каталога кода
+    (`sources`, иначе каталог самого файла) без расширения — через `/` (`v2/roles`, так его грузят
+    скрипты) и через точку (`pkg.rules`, импорт Python); соседям по каталогу — ещё имя (`.rules`,
+    `./rules`)."""
+    keys: dict[PurePosixPath, set] = {}
+    for path in changed:
+        if path.suffix not in CODE:
+            continue
+        roots = [PurePosixPath(s) for s in sources if path.is_relative_to(PurePosixPath(s))]
+        if sources and not roots:
+            continue
+        base = max(roots, key=lambda r: len(r.parts)) if roots else path.parent
+        key = path.relative_to(base).with_suffix("").as_posix()
+        keys.setdefault(base, set()).update({key, key.replace("/", ".")})
+        keys.setdefault(path.parent, set()).add(path.stem)
+    return keys
+
+
+def importers(
+    root: Path, files: list[str], changed: list[PurePosixPath], sources: list[str]
+) -> set[str]:
+    """Имена файлов кода, которые упоминают изменённый модуль (`import_keys`); каждый файл
+    читается один раз."""
+    keys = import_keys(changed, sources)
+    found: set[str] = set()
+    if not keys:
+        return found
+    own = set(changed)
+    for rel in files:
+        other = PurePosixPath(rel)
+        if other in own or (other.suffix and other.suffix not in CODE):
+            continue
+        wanted = {
+            k
+            for base, group in keys.items()
+            if base == PurePosixPath(".") or other.is_relative_to(base)
+            for k in group
+        }
+        if not wanted:
+            continue
+        text = read(root, rel)
+        if any(k in text for k in wanted):
+            found.add(name_of(other))
+    return found
+
+
+def select(root: Path, changed: list[str], conf: dict) -> list[str]:
+    """Задетые тесты по изменённым файлам `changed` (пути от корня) — отсортированный список."""
+    files = tracked(root)
+    tests = sorted(f for f in files if matches(f, conf["tests"]))
+    paths = [PurePosixPath(p) for p in changed]
+    changed_set = set(changed)
+    names = {name_of(p) for p in paths}
+    names |= importers(root, files, paths, conf["sources"])
+    names.discard("")
+    own = {plain(name_of(p)) for p in paths}
+    chosen = []
+    for test in tests:
+        if test in changed_set:
+            chosen.append(test)
+            continue
+        if matches(test, conf["slow"]):
+            stem = plain(PurePosixPath(test).stem)
+            if stem.removeprefix("test_") in own or stem.removesuffix("_test") in own:
+                chosen.append(test)
+            continue
+        text = read(root, test)
+        if any(name in text for name in names):
+            chosen.append(test)
+    return chosen
+
+
+def write_out(changed: list[str], tests: list[str]) -> None:
+    out = os.environ.get(OUT_ENV)
+    if not out:
+        return
+    try:
+        Path(out).write_text(
+            json.dumps({"files": changed, "tests": tests}, ensure_ascii=False), encoding="utf-8"
+        )
+    except OSError as exc:
+        print(f"affected-tests: отбор не записан в {out}: {exc}", file=sys.stderr)
+
+
+def stop_group(pid: int) -> None:
+    try:
+        os.killpg(pid, signal.SIGKILL)  # вся группа: внуки прогона тоже
+    except OSError:
+        pass
+
+
+def run_tests(argv: list[str], chosen: list[str], limit: float | None) -> int:
+    """Прогон своей группой процессов (предел — по всей группе). SIGTERM, SIGINT и SIGHUP самому
+    скрипту (`run-log` при остановке, предел проверки пути v2) гасят и прогон: сиротой он
+    менял бы рабочую копию после итога. Обработчик — до строки «отобрано» и до запуска."""
+    running: list[int] = []
+    stopped: list[int] = []  # сигнал пришёл, пока прогон запускался: его гасит код после запуска
+
+    def forward(signum, _frame):
+        stopped.append(signum)
+        if not running:
+            return
+        stop_group(running[0])
+        os._exit(128 + signum)  # без `wait` внутри обработчика: он прервал `wait` прогона
+
+    for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+        signal.signal(sig, forward)
+    print(f"affected-tests: отобрано {len(chosen)}: {' '.join(chosen)}", flush=True)
+    proc = subprocess.Popen([*argv, *chosen], start_new_session=True)
+    running.append(proc.pid)
+    if stopped:
+        stop_group(proc.pid)
+        os._exit(128 + stopped[0])
+    try:
+        return proc.wait(timeout=limit)
+    except subprocess.TimeoutExpired:
+        stop_group(proc.pid)
+        proc.wait()
+        print(
+            f"affected-tests: предел времени отбора {limit:g} с превышен — прогон остановлен. "
+            "Долгие тесты — пометить медленными (`slow:` блока ```affected-tests профиля): их "
+            "гоняет CI, а отбор — только при правке их самих",
+            flush=True,
+        )
+        return TIMEOUT_CODE
+
+
+def main(argv: list[str]) -> int:
+    only_list = bool(argv) and argv[0] == "--list"
+    changed = [a for a in (argv[1:] if only_list else argv) if a]
+    root = Path.cwd()
+    try:
+        conf = read_settings(root)
+    except SettingsError as exc:
+        print(f"affected-tests: {PROFILE}: {exc}", file=sys.stderr)
+        return 2
+    try:
+        chosen = select(root, changed, conf)
+    except SettingsError as exc:
+        print(f"affected-tests: отбор не сделан — {exc}", file=sys.stderr)
+        return 2
+    write_out(changed, chosen)
+    if only_list:
+        print("\n".join(chosen))
+        return 0
+    if not chosen:
+        print(f"affected-tests: задетых тестов нет (изменённых файлов: {len(changed)})")
+        return 0
+    if not conf["run"]:
+        print(
+            f"affected-tests: {PROFILE}: в блоке ```affected-tests нет `run` — нечем гонять "
+            "отобранные тесты",
+            file=sys.stderr,
+        )
+        return 2
+    return run_tests(conf["run"], chosen, conf["limit"])
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
