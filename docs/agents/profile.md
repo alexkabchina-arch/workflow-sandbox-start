@@ -20,6 +20,12 @@ uv venv --clear --python 3.12 .venv
 uv pip install --python .venv/bin/python -e ".[dev]"
 ```
 
+В рабочей копии тикета окружение поднимает `scripts/session/setup` (тот же выбор варианта; `.venv`
+уже есть — пропуск): `session-start` зовёт его до стандартного хука перед коммитом, а хук зовёт
+`.venv/bin/ruff` (блок ```fast-checks ниже). Ещё хуку нужен `gitleaks` на `PATH` (Homebrew на Mac
+владельца; в песочнице его ставит `sandbox up`). Docker, сеть (кроме установки пакетов) и кэш не
+нужны.
+
 Во втором варианте pip в окружении нет: пакеты — только `uv pip install --python .venv/bin/python …`.
 `--clear` пересоздаёт `.venv`: окружение привязано к платформе, созданное на Mac внутри песочницы
 не запустится. Проверки ниже зовут `.venv/bin/…`: worktree без окружения оркестратор с
@@ -41,14 +47,14 @@ uv pip install --python .venv/bin/python -e ".[dev]"
 нет. Формат и линтер — по всему проекту, секреты — в застейдженном:
 
 ```fast-checks
-format: ruff format .
-lint: ruff check .
+format: .venv/bin/ruff format .
+lint: .venv/bin/ruff check .
 secrets: gitleaks git --pre-commit --staged --redact --no-banner -v
 ```
 
-Окружение хука: `ruff` и `gitleaks` на `PATH` (Homebrew на Mac владельца), без `.venv` — у рабочей
-копии тикета его нет до первого прогона тестов. `format` — форматер в режиме правки: исправил файл —
-коммит остановлен, исправление добавить (`git add`) и повторить коммит.
+Окружение хука — раздел «Окружение» выше: `.venv` с ruff той же версии, что у `/ship` и CI, и
+`gitleaks` на `PATH`. `format` — форматер в режиме правки: исправил файл — стандартный хук
+останавливает коммит, исправление добавить (`git add`) и повторить коммит.
 
 ## Ожидаемые job CI
 

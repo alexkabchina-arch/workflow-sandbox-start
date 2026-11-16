@@ -1,0 +1,15 @@
+#!/bin/sh
+# Окружение рабочей копии тикета (воркфлоу #463): `session-start` зовёт его в корне каждой новой
+# рабочей копии до стандартного хука перед коммитом — хук зовёт `.venv/bin/ruff`. Варианты — как в
+# разделе «Окружение» `docs/agents/profile.md`. Повторный запуск безопасен.
+set -e
+if [ -x .venv/bin/ruff ]; then
+    exit 0
+fi
+if command -v python3.12 >/dev/null 2>&1; then
+    python3.12 -m venv .venv
+    .venv/bin/pip install -q -e ".[dev]"
+else
+    uv venv --clear --python 3.12 .venv
+    uv pip install --python .venv/bin/python -e ".[dev]"
+fi
