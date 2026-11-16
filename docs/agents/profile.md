@@ -33,14 +33,26 @@ uv pip install --python .venv/bin/python -e ".[dev]"
 
 ## Команды
 
-| Что             | Команда                        |
-| --------------- | ------------------------------ |
-| Тесты           | `.venv/bin/pytest -q`          |
-| Линтер          | `.venv/bin/ruff check .`       |
-| Формат (проверка) | `.venv/bin/ruff format --check .` |
-| Формат (правка) | `.venv/bin/ruff format .`      |
+Проверки ветки — допуск `scripts/canon/ticket ship` до ревью (воркфлоу #465): строки
+```fast-checks ниже, затем эти; одноимённая строка отсюда заменяет строку хука:
 
-Все три проверки быстрые (секунды): вывод можно читать напрямую.
+```checks
+tests: python3 scripts/canon/affected-tests {files}
+lint: .venv/bin/ruff check .
+format: .venv/bin/ruff format --check .
+secrets: python3 scripts/canon/secrets
+```
+
+Формат (правка): `.venv/bin/ruff format .`.
+
+Тесты маршрута — задетые правкой (воркфлоу #464): полный набор (`.venv/bin/pytest -q`) гоняет
+только CI на PR и ночной прогон.
+
+```affected-tests
+tests: tests/test*.py
+sources: sandbox
+run: .venv/bin/pytest -q
+```
 
 Быстрые проверки — стандартный хук перед коммитом воркфлоу (воркфлоу #463): подготовка
 `scripts/canon/session-start` ставит его в каждую рабочую копию тикета; хоть одна красная — коммита
