@@ -7,8 +7,12 @@
 
 ## Процесс — канон
 
-Процесс — канон `alexkabchina-arch/workflow`: скиллы `.claude/skills/`, скрипты `scripts/canon/`,
-версия и список вендоренных файлов — `.canon.lock`. Вендоренное руками не править: обновление —
+Этот раздел ставит и обновляет установка воркфлоу (`canon-sync`); руками не править. Правила
+проекта — вне него.
+
+Процесс — канон `alexkabchina-arch/workflow`: скиллы `.claude/skills/` и
+`.agents/skills/` (Codex), скрипты `scripts/canon/`, версия и список вендоренных файлов —
+`.canon.lock`. Вендоренное руками не править: обновление —
 `canon-sync`, изменение процесса — PR в канон. Проектная часть процесса — профиль
 `docs/agents/profile.md`; трекер и метки — `docs/agents/issue-tracker.md`,
 `docs/agents/triage-labels.md`.
