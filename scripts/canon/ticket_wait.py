@@ -63,11 +63,11 @@ PENDING = {"PENDING", "EXPECTED", "QUEUED", "IN_PROGRESS", "WAITING", "REQUESTED
 MISSES = "canon-tests/misses.jsonl"
 RUN_URL = re.compile(r"/actions/runs/(\d+)")
 MISS_TASK = """Возможный промах отбора задетых тестов: CI упал на тестах, которых не было в
-отборе шага «тесты и линтеры», — {tests}. Он записан и виден владельцу комментарием в PR. Падение
-вызвала правка ветки — кроме починки поправь отбор в той же ветке, чтобы такой тест шёл при правке
-этих файлов: блок ```affected-tests профиля (`sources`, `tests`) или своя команда проекта в строке
-`tests` блока ```checks; сужать отбор нельзя. Падение не от ветки (красный `main`, нестабильный
-тест) — отбор не трогать."""
+отборе допуска или тестов исправлений, — {tests}. Он записан и виден владельцу комментарием в
+PR. Падение вызвала правка ветки — кроме починки поправь отбор в той же ветке, чтобы такой тест
+шёл при правке этих файлов: блок ```affected-tests профиля (`sources`, `tests`) или своя команда
+проекта в строке `tests` блока ```checks; сужать отбор нельзя. Падение не от ветки (красный
+`main`, нестабильный тест) — отбор не трогать."""
 
 AUTOFIX = """В приложении с Auto-fix (включён после привязки PR) — закончи ход: событие CI разбудит
 сессию, и делать это задание будет она. Без Auto-fix (терминал) — сейчас."""
@@ -267,22 +267,34 @@ class Wait:
         body = (
             f"Красный CI на {head[:7]}: {', '.join(checks)}. Круг {k} из {LIMIT}.\n{AUTOFIX}\n"
             f"Найди причину и почини в ветке тикета (коммит, сообщение одной строкой `-m`); "
-            f"затем `ticket ship {self.n}` — проверки и отметка на новый head без второго "
-            f"ревью — и снова ожидание. {self.where()}"
+            f"затем `ticket ship {self.n}` — тесты починки перед /verify, догон и отметка на "
+            f"новый head без второго ревью — и снова ожидание. {self.where()}"
         )
         if missed:
             body += "\n\n" + MISS_TASK.format(tests=self.ci.listed(missed))
         return self.task("Красный CI", body)
 
+    def untested(self, head: str) -> bool:
+        """После последнего прогона тестов маршрута (`tested`) в ветке есть свои коммиты — не
+        слияния: починка без /verify впереди тестов не гоняла (#465), отбор её не покрывает.
+        Нет `tested` (состояние до #465) или он не предок head — не известно: как раньше."""
+        tested = self.state["tested"]
+        if not tested:
+            return False
+        res = self.core.run("git", "log", "--first-parent", "--no-merges", "--format=%H",
+                            f"{tested}..{head}")  # fmt: skip
+        return res.returncode == 0 and bool(res.stdout.strip())
+
     def misses(self, head: str, pr: dict) -> list[str]:
-        """Промах отбора задетых тестов (#464): CI упал на тесте, которого не было в отборе шага
-        «тесты и линтеры». Упавшие — по отчёту прогона (артефакт `test-report…`, контракт CI
+        """Промах отбора задетых тестов (#464): CI упал на тесте, которого не было в отборе допуска
+        и тестов исправлений. Упавшие — по отчёту прогона (артефакт `test-report…`, контракт CI
         профиля); промах — запись в `misses.jsonl` каталога состояния и комментарий в PR, один
         раз на head. Отбора нет (проверка без `{files}`) или отчёта нет — пусто."""
         core, st = self.core, self.state
-        picked = [
-            r["selected"] for r in (st["checks"] or {}).get("results", []) if r.get("selected")
-        ]
+        if self.untested(head):
+            return []  # починка без тестов маршрута: её падения в CI — не промах отбора
+        ran = [st["checks"] or {}, st["retest"] or {}]  # допуск и тесты исправлений (#465)
+        picked = [r["selected"] for run in ran for r in run.get("results", []) if r.get("selected")]
         if not picked:
             return []
         seen = st["misses"] or {}

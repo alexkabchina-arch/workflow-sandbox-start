@@ -4,9 +4,10 @@
     python3 scripts/canon/affected-tests [ФАЙЛ…]           # отбор и прогон
     python3 scripts/canon/affected-tests --list [ФАЙЛ…]    # только отбор, по строке на тест
 
-Из корня рабочей копии. Файлы — изменённые файлы ветки: шаг маршрута «тесты и линтеры»
-(`ticket ship`) и проверка в песочнице пути v2 подставляют их на место `{files}` в строке
-`tests` блока ```checks профиля (`tests: python3 scripts/canon/affected-tests {files}`).
+Из корня рабочей копии. Файлы — изменённые файлы ветки: допуск маршрута (`ticket ship`; в
+тестах исправлений — файлы починки) и проверка в песочнице пути v2 подставляют их на место
+`{files}` в строке `tests` блока ```checks профиля (`tests: python3 scripts/canon/affected-tests
+{files}`).
 Настройки — блок ```affected-tests профиля (`docs/agents/profile.md`), строки `ключ: значение`:
 
 - `tests` — где тесты, шаблоны через пробел (по умолчанию `tests/**/test*.py`);
