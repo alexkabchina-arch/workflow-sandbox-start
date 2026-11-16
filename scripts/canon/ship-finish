@@ -20,10 +20,10 @@
    отправлено; в профиле её нет — предупреждение, ветка уходит как раньше.
    Затем местные ворота — только когда в профиле `origin/main` есть блок ```gates (сам воркфлоу
    без CI, исключение 3б, #328; блок берётся не из ветки — ветка не снимет ворота сама себе): его
-   команды (`имя: команда`) и затронутые тесты — файлы `tests/test*.py`, упоминающие изменённый
-   файл ветки, а для изменённого модуля скриптов (`project/scripts/canon/*.py`) — и скрипты,
-   которые его упоминают; `test_session_start`, `test_ticket_start`, `test_stop_check` и
-   `test_review_guard` (старый путь) — только когда ветка меняет свой скрипт или сам тест (#376).
+   команды (`имя: команда`) и затронутые тесты — общим отбором канона `affected-tests` (#464) по
+   изменённым файлам ветки и блоку ```affected-tests того же профиля: тесты, упоминающие
+   изменённый файл или файл, который грузит изменённый модуль; медленные (`slow`, у воркфлоу —
+   тесты старого пути, #376) — только когда ветка меняет свой скрипт или сам тест.
    Каждая команда — под `run-log`, во временном worktree на проверяемом коммите
    (неотслеживаемые файлы не участвуют); затронутые тесты — одним прогоном в машине Docker
    Sandboxes, `scripts/vm-test run --commit <коммит> -- <файлы>` (#376), а где запускателя нет —
@@ -112,16 +112,7 @@ HERE = Path(__file__).resolve().parent
 PROFILE = Path("docs/agents/profile.md")
 RUN_LOG_END = re.compile(r"^run-log: завершено с кодом \S+ · лог: (.+)$", re.M)
 GATES_BLOCK = re.compile(r"^```gates[ \t]*\n(.*?)^```", re.M | re.S)
-CANON_SCRIPTS = Path("project/scripts/canon")
 GATES_GREEN = "canon-gates-green"  # зелёные коммиты ворот, в каталоге git
-# Тесты старого пути (#376): в воротах — только когда ветка меняет свой скрипт (или сам тест);
-# перед тегом полный набор гоняет и их. Ослабление — по слову владельца 27.10.
-OLD_PATH = {
-    "tests/test_session_start.py": f"{CANON_SCRIPTS}/session-start",
-    "tests/test_ticket_start.py": f"{CANON_SCRIPTS}/ticket_start.py",
-    "tests/test_stop_check.py": f"{CANON_SCRIPTS}/stop-check",
-    "tests/test_review_guard.py": f"{CANON_SCRIPTS}/review-guard",
-}
 VM_TEST = Path("scripts/vm-test")  # запускатель машины тестов воркфлоу (#376)
 # Коды `vm-test`, при которых набора не было: ошибка запуска, занято, сбой машины.
 VM_NO_RUN = {
@@ -260,41 +251,23 @@ def parse_gates(text: str | None) -> list[tuple[str, list[str]]] | None:
         raise UsageError(f"{PROFILE} (блок gates): строка не разобрана — {exc}") from None
 
 
-def affected_tests(root: Path, sha: str) -> list[str]:
-    """Затронутые тесты по правилу `AGENTS.md` воркфлоу: `tests/test*.py`, упоминающие изменённый
-    файл ветки (`.py` — по имени без расширения), сами изменённые тесты, а для изменённого модуля
-    скриптов — ещё файлы, упоминающие скрипты, которые его грузят."""
+def affected_tests(root: Path, sha: str, profile: str) -> list[str]:
+    """Затронутые тесты — общим отбором канона (`affected-tests`, #464): по изменённым файлам ветки
+    и настройкам блока ```affected-tests профиля `origin/main` (`profile` — его текст): ветка не
+    сузит отбор сама себе."""
     span = f"{TARGET}...{sha}"
     changed = [
-        Path(p)
-        for p in run("git", "diff", "--name-only", "--no-renames", "-z", span).split("\0")
-        if p
+        p for p in run("git", "diff", "--name-only", "--no-renames", "-z", span).split("\0") if p
     ]
-    names = {p.stem if p.suffix == ".py" else p.name for p in changed}
-    scripts = root / CANON_SCRIPTS
-    # Модуль скриптов — по имени, вложенный (`v2/roles.py`, #333) — путём без расширения: так его
-    # грузит скрипт (`load(…, "v2/roles.py")`), а одно имя `roles` нашлось бы где угодно.
-    modules = [
-        p.relative_to(CANON_SCRIPTS).with_suffix("").as_posix()
-        for p in changed
-        if p.is_relative_to(CANON_SCRIPTS) and p.suffix == ".py"
-    ]
-    if modules and scripts.is_dir():
-        for script in sorted(scripts.iterdir()):
-            if not script.is_file():
-                continue
-            text = script.read_text(encoding="utf-8", errors="replace")
-            if any(m in text for m in modules):
-                names.add(script.stem if script.suffix == ".py" else script.name)
-    chosen = []
-    for test in sorted((root / "tests").glob("test*.py")):
-        rel = test.relative_to(root)
-        if (own := OLD_PATH.get(rel.as_posix())) and not {rel, Path(own)} & set(changed):
-            continue  # старый путь — только при правке своего скрипта (#376)
-        text = test.read_text(encoding="utf-8", errors="replace")
-        if rel in changed or any(name in text for name in names):
-            chosen.append(rel.as_posix())
-    return chosen
+    selector = load_canon("affected-tests")
+    try:
+        conf = selector.parse(profile)
+    except selector.SettingsError as exc:
+        raise UsageError(f"{PROFILE}: {exc}") from None
+    try:
+        return selector.select(root, changed, conf)
+    except selector.SettingsError as exc:  # сбой git: ноль тестов был бы зелёными воротами
+        raise ShipError(f"затронутые тесты не отобраны — {exc}") from None
 
 
 def vm_busy_wait() -> float:
@@ -340,7 +313,7 @@ def check_gates(sha: str) -> None:
     failed, no_run = [], None
     try:
         run("git", "worktree", "add", "-q", "--detach", str(tree), sha)
-        tests = affected_tests(tree, sha)
+        tests = affected_tests(tree, sha, text)
         vm = None
         if tests and (tree / VM_TEST).is_file():
             # Затронутые тесты — одним прогоном в машине (#376), а не по файлу на Mac.

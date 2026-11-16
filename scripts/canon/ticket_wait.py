@@ -40,11 +40,14 @@ worktree тикета может убрать чужая уборка слиты
 from __future__ import annotations
 
 import argparse
+import json
 import os
+import re
+import tempfile
 import time
 import types
 from datetime import datetime
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 LIMIT = 2
 POLL, TIMEOUT = 60.0, 1200.0
@@ -55,6 +58,16 @@ FIELDS = (
 )
 MERGEABLE = {"CLEAN", "HAS_HOOKS"}  # сливать можно: проверки зелёные, требования выполнены
 PENDING = {"PENDING", "EXPECTED", "QUEUED", "IN_PROGRESS", "WAITING", "REQUESTED"}
+
+# Промахи отбора задетых тестов (#464) — в каталоге git, общем для рабочих копий.
+MISSES = "canon-tests/misses.jsonl"
+RUN_URL = re.compile(r"/actions/runs/(\d+)")
+MISS_TASK = """Возможный промах отбора задетых тестов: CI упал на тестах, которых не было в
+отборе шага «тесты и линтеры», — {tests}. Он записан и виден владельцу комментарием в PR. Падение
+вызвала правка ветки — кроме починки поправь отбор в той же ветке, чтобы такой тест шёл при правке
+этих файлов: блок ```affected-tests профиля (`sources`, `tests`) или своя команда проекта в строке
+`tests` блока ```checks; сужать отбор нельзя. Падение не от ветки (красный `main`, нестабильный
+тест) — отбор не трогать."""
 
 AUTOFIX = """В приложении с Auto-fix (включён после привязки PR) — закончи ход: событие CI разбудит
 сессию, и делать это задание будет она. Без Auto-fix (терминал) — сейчас."""
@@ -67,6 +80,28 @@ def load_session_start() -> types.ModuleType:
     module.__file__ = str(path)
     exec(compile(path.read_text(encoding="utf-8"), str(path), "exec"), module.__dict__)
     return module
+
+
+def load_ci() -> types.ModuleType:
+    """`v2/ci.py` рядом со скриптом — отчёт CI по тестам (`fetch`, `failed_tests`, `listed`)."""
+    path = Path(__file__).resolve().parent / "v2" / "ci.py"
+    module = types.ModuleType("canon_ci_for_ticket")
+    module.__file__ = str(path)
+    exec(compile(path.read_text(encoding="utf-8"), str(path), "exec"), module.__dict__)
+    return module
+
+
+def picked_place(place: str, chosen: list[str]) -> bool:
+    """Упавший тест — из отбора: место (`classname`) совпало с файлом отбора путём (`v2/ci.py`,
+    `touches`) или первым звеном — именем файла без каталога (`unittest discover -s tests` пишет
+    `test_calc.TestCalc`)."""
+    stems = {str(PurePosixPath(t).with_suffix("")) for t in chosen}
+    parts = place.split(".")
+    if any("/".join(parts[:i]) in stems for i in range(1, len(parts) + 1)):
+        return True
+    if any(t == place or t.endswith(f"/{place}") for t in chosen):
+        return True
+    return parts[0] in {PurePosixPath(t).stem for t in chosen}
 
 
 def session_dir() -> Path | None:
@@ -116,6 +151,7 @@ class Wait:
         self.guard_error = ""  # сбой `gh` на последнем перезапуске сторожа
         self.prev: dict = {}  # PR на прошлом опросе
         self.again = core.command("wait", number)
+        self.ci = load_ci()  # упавшие тесты по отчёту CI — для промахов отбора (#464)
 
     def run(self, poll: float, timeout: float) -> int:
         core, st = self.core, self.state
@@ -167,7 +203,7 @@ class Wait:
             return self.human("авто-мёрж выключен — PR придержал владелец")
         head = pr.get("headRefOid") or ""
         if checks := self.start.failed_checks(pr):
-            return self.red(head, checks)
+            return self.red(head, checks, pr)
         if (guard := self.start.failed_guard(pr)) and (out := self.guard(head, guard)):
             return out
         main_base = pr.get("baseRefName", "main") == "main"
@@ -223,17 +259,91 @@ class Wait:
             )
         return (core.DONE, f"Тикет #{self.n}: {line}", body, ())
 
-    def red(self, head: str, checks: list[str]):
+    def red(self, head: str, checks: list[str], pr: dict | None = None):
         k = self.round("ci", head)
         if k > LIMIT:
             return self.stop(f"красный CI {k}-й раз после финиша: {', '.join(checks)}")
+        missed = self.misses(head, pr or {})
         body = (
             f"Красный CI на {head[:7]}: {', '.join(checks)}. Круг {k} из {LIMIT}.\n{AUTOFIX}\n"
             f"Найди причину и почини в ветке тикета (коммит, сообщение одной строкой `-m`); "
             f"затем `ticket ship {self.n}` — проверки и отметка на новый head без второго "
             f"ревью — и снова ожидание. {self.where()}"
         )
+        if missed:
+            body += "\n\n" + MISS_TASK.format(tests=self.ci.listed(missed))
         return self.task("Красный CI", body)
+
+    def misses(self, head: str, pr: dict) -> list[str]:
+        """Промах отбора задетых тестов (#464): CI упал на тесте, которого не было в отборе шага
+        «тесты и линтеры». Упавшие — по отчёту прогона (артефакт `test-report…`, контракт CI
+        профиля); промах — запись в `misses.jsonl` каталога состояния и комментарий в PR, один
+        раз на head. Отбора нет (проверка без `{files}`) или отчёта нет — пусто."""
+        core, st = self.core, self.state
+        picked = [
+            r["selected"] for r in (st["checks"] or {}).get("results", []) if r.get("selected")
+        ]
+        if not picked:
+            return []
+        seen = st["misses"] or {}
+        if head in seen:
+            return seen[head]
+        chosen = sorted({t for sel in picked for t in sel["tests"]})
+        files = sorted({f for sel in picked for f in sel["files"]})
+        runs = sorted(
+            {
+                m.group(1)
+                for item in pr.get("statusCheckRollup") or []
+                # Сторож и точечный прогон тестов ревьюера — не CI тестов (как `failed_checks`).
+                if self.start.is_red(item)
+                and item.get("name") != self.start.GUARD
+                and item.get("workflowName") != self.start.SPOT_WORKFLOW
+                and (m := RUN_URL.search(item.get("detailsUrl") or ""))
+            }
+        )
+        failed: dict[str, str] = {}
+        repo = "/".join(str(st["pr"]).split("/")[3:5])  # ссылка PR: https://github.com/o/r/pull/N
+        broken = False
+        for run_id in runs:
+            with tempfile.TemporaryDirectory(prefix="canon-report-") as tmp:
+                try:
+                    self.ci.fetch(core, repo, run_id, tmp)
+                except core.Failure as exc:
+                    core.say(f"ticket wait: отчёт по тестам прогона {run_id} не скачан — {exc}")
+                    broken = True
+                    continue
+                failed.update(self.ci.failed_tests(Path(tmp)))
+        missed = sorted(name for name, place in failed.items() if not picked_place(place, chosen))
+        if not missed:
+            if not broken:  # отчёт не скачан (сбой или его нет) — сверка на следующем красном
+                st["misses"] = {**seen, head: []}
+            return []
+        st["misses"] = {**seen, head: missed}
+        record = {
+            "ticket": self.n,
+            "pr": st["pr"],
+            "head": head,
+            "at": core.now(),
+            "tests": missed,
+            "files": files,
+            "selected": chosen,
+        }
+        log = core.common_dir() / MISSES
+        log.parent.mkdir(parents=True, exist_ok=True)
+        with log.open("a", encoding="utf-8") as out:
+            out.write(json.dumps(record, ensure_ascii=False) + "\n")
+        text = (
+            f"Возможный промах отбора задетых тестов на `{head[:7]}`: CI упал на тестах вне "
+            f"отбора — {self.ci.listed(missed)}. Изменённые файлы: {self.ci.listed(files)}. Отбор "
+            "правится в ветке (блок ```affected-tests профиля или своя команда проекта), если "
+            "падение вызвала правка ветки, а не красный `main` или нестабильный тест; запись "
+            f"промаха — `{MISSES}` в каталоге git."
+        )
+        try:
+            core.gh("pr", "comment", st["pr"], "--body", text)
+        except core.Failure as exc:
+            core.say(f"ticket wait: комментарий о промахе не записан — {exc}")
+        return missed
 
     def guard(self, head: str, item: dict):
         """Сторож упал при стоящей отметке: перезапуск его прогона; не помог — задание по логу."""

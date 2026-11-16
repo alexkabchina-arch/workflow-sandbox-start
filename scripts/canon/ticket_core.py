@@ -18,6 +18,7 @@
 
 from __future__ import annotations
 
+import fnmatch
 import json
 import os
 import re
@@ -64,6 +65,10 @@ ASK_MARK = "<!-- canon-ticket-ask {stamp} -->"
 CHECKS_BLOCK = re.compile(r"^```checks[ \t]*\n(.*?)^```", re.M | re.S)
 # Быстрые проверки пути v2 (#338): хук на коммите в песочнице; `format` правит, прочие блокируют.
 FAST_CHECKS_BLOCK = re.compile(r"^```fast-checks[ \t]*\n(.*?)^```", re.M | re.S)
+# Аргумент `{files}` проверки (#464, как у пути v2 — `v2/checks.py`): файлы диффа ветки с
+# `origin/main`, `{files:шаблоны}` — только подходящие (через запятую).
+FILES_ARG = re.compile(r"^\{files(?::([^}]*))?\}$")
+AFFECTED_OUT = "CANON_AFFECTED_OUT"  # куда команда задетых тестов пишет свой отбор (#464)
 # Профиль до блока `checks` (проекты на каноне до #154): строки таблицы «Команды».
 TABLE_CHECKS = {"Тесты": "tests", "Линтер": "lint", "Формат (проверка)": "format"}
 TABLE_ROW = re.compile(r"^\|\s*([^|]+?)\s*\|\s*`([^`]+)`\s*\|", re.M)
@@ -96,11 +101,12 @@ def elapsed(since: str | None) -> str:
 
 
 def run(
-    *cmd: str, cwd: Path | None = None, timeout: float | None = None
+    *cmd: str, cwd: Path | None = None, timeout: float | None = None, env: dict | None = None
 ) -> subprocess.CompletedProcess:
     return subprocess.run(
         cmd,
         cwd=cwd,
+        env=env,
         capture_output=True,
         text=True,
         encoding="utf-8",
@@ -549,6 +555,35 @@ def parse_checks(text: str, profile) -> list[tuple[str, list[str]]]:
             raise Failure(f"в профиле {profile} нет блока ```checks (раздел «Команды»)")
         return [(name, shlex.split(command)) for name, command in rows]
     return block_lines(block.group(1), profile, "checks")
+
+
+def branch_files(base: str = "origin/main") -> list[str]:
+    """Изменённые файлы ветки — дифф `base...HEAD`, как у пути v2 (`v2/doctor.py`): добавленные,
+    изменённые, переименованные; удалённых нет — линтер на них упал бы."""
+    out = git("diff", "--name-only", "--diff-filter=ACMR", "-z", f"{base}...HEAD")
+    return [p for p in out.split("\0") if p]
+
+
+def expand_files(argv: list[str], files: list[str]) -> list[str] | None:
+    """`{files}` и `{files:шаблоны}` в команде проверки — файлы ветки; подходящих нет — None
+    (проверка пропускается), как у пути v2."""
+    out = []
+    for arg in argv:
+        m = FILES_ARG.match(arg)
+        if not m:
+            out.append(arg)
+            continue
+        patterns = [p.strip() for p in (m[1] or "").split(",") if p.strip()]
+        chosen = [
+            f
+            for f in files
+            if not patterns
+            or any(fnmatch.fnmatch(f, p) or fnmatch.fnmatch(Path(f).name, p) for p in patterns)
+        ]
+        if not chosen:
+            return None
+        out += chosen
+    return out
 
 
 def fast_checks(text: str, profile) -> list[tuple[str, list[str]]] | None:
