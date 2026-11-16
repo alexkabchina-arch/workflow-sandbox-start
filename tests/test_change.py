@@ -22,6 +22,12 @@ def test_change_exact_on_large_sum():
     assert change_kop(10**17 + 1, 10**17) == 1
 
 
+@pytest.mark.parametrize(("paid", "due", "expected"), [(0, 0, 0), (500, 0, 500), (0, 500, 0)])
+def test_zero_amount_is_allowed(paid, due, expected):
+    # Граница: ноль — не отрицательная сумма, ошибки нет
+    assert change_kop(paid, due) == expected
+
+
 @pytest.mark.parametrize(("paid", "due"), [(-1, 1000), (1000, -1), (-100, -500)])
 def test_negative_amount_is_error(paid, due):
     with pytest.raises(ValueError, match=r"^сумма не может быть отрицательной$"):
