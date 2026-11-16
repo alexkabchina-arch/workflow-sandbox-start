@@ -6,6 +6,7 @@ ERROR = "сумма должна быть целым неотрицательн�
 
 def points(total_kop: int) -> int:
     """Баллы за чек: 1 за каждые полные 100 ₽ суммы в копейках."""
-    if type(total_kop) is not int or total_kop < 0:
+    # bool — подкласс int, но не сумма: отвергается, как в bags.py.
+    if isinstance(total_kop, bool) or not isinstance(total_kop, int) or total_kop < 0:
         raise ValueError(ERROR)
-    return int(total_kop / KOP_PER_POINT)
+    return total_kop // KOP_PER_POINT  # целое деление: без float, точно на любых суммах

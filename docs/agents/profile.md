@@ -33,8 +33,8 @@ uv pip install --python .venv/bin/python -e ".[dev]"
 
 ## Команды
 
-Проверки ветки — допуск `scripts/canon/ticket ship` до ревью (воркфлоу #465): строки
-```fast-checks ниже, затем эти; одноимённая строка отсюда заменяет строку хука:
+Проверки ветки — допуск `scripts/canon/ticket ship` до ревью (воркфлоу #465): строки блока
+быстрых проверок ниже, затем эти; одноимённая строка отсюда заменяет строку хука:
 
 ```checks
 tests: python3 scripts/canon/affected-tests {files}
@@ -49,7 +49,7 @@ secrets: python3 scripts/canon/secrets
 только CI на PR и ночной прогон.
 
 ```affected-tests
-tests: tests/test*.py
+tests: tests/**/test*.py
 sources: sandbox
 run: .venv/bin/pytest -q
 ```
