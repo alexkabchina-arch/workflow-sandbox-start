@@ -37,6 +37,8 @@ LABEL = "ready-for-human"
 # тоже не ответ (`is_answer`).
 # Разделы вопроса под оркестратором (спека #208): владелец отвечает с телефона, не зная хода сессии.
 SECTIONS = ("Причина", "Сделано", "Доступно")
+# Ответить может и координатор по записанному (#457) — не только владелец.
+ANSWER_HEAD = "Ответ на вопрос (владельца или координатора по записанному):"
 
 
 class NoQuestion(Exception):
@@ -93,11 +95,14 @@ def worktree(core, n: int) -> Path:
 
 
 class Ask:
-    def __init__(self, n: int, core):
+    def __init__(self, n: int, core, root: Path | None = None):
+        """`root` — рабочая копия тикета, если её уже знает вызывающий (`ticket start`: план
+        подготовки, #457); иначе — по ветке или `worktree_of`."""
         self.n, self.core = n, core
         self.cmd = core.command("ask", n)
         self.state = core.State(n)
-        self.root = worktree(core, n)
+        self.root = root or worktree(core, n)
+        self.answer = ""  # ответ, найденный `wait`
         self.dir = core.answers(self.root)
 
     def run(self, text: str | None) -> int:
@@ -228,7 +233,7 @@ class Ask:
         if not replies:
             chat = "" if core.orchestrated() else ", `.ticket/reply.md` пуст"  # чата нет (#275)
             return self.waiting(f"Ответа нет: в тикете после вопроса ответа нет{chat}." + held)
-        answer = "\n\n".join(replies)
+        answer = self.answer = "\n\n".join(replies)
         note = ""
         try:
             if not core.v2_task():  # у сессии v2 токен на чтение: метку снял оркестратор (#341)
@@ -238,10 +243,10 @@ class Ask:
         st["question"], st["waiting"] = None, core.AGENT
         st.dir.mkdir(parents=True, exist_ok=True)
         (st.dir / f"answer-{question['stamp']}.md").write_text(answer + "\n", encoding="utf-8")
-        body = f"Ответ владельца:\n\n{core.quote(answer)}\n{note}{held}\n\n{self.next_step(answer)}"
+        body = f"{ANSWER_HEAD}\n\n{core.quote(answer)}\n{note}{held}\n\n{self.next_step(answer)}"
         return (
             core.TURN,
-            f"Тикет #{n}: ответ владельца",
+            f"Тикет #{n}: ответ на вопрос",
             body,
             (core.command("ship", n),),
         )

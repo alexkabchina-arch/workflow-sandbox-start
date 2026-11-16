@@ -19,8 +19,16 @@
    ветки (`ticket_core.MANUAL_END`); вопрос владельцу — только
    `ticket ask N`; затем `ticket ship N`. Действия — словами, имя инструмента Claude — только
    примером в скобках (#453): задание выполнит любой агент. Маршрут тикета уже идёт (шаг `ship`
-   записан) или вопрос ждёт ответа — задание продолжить его. PR маршрута слит (тикет
+   записан) — задание продолжить его. PR маршрута слит (тикет
    переоткрыт) — маршрут с нуля: прошлый — в архив рядом с состоянием, задание — `/implement N`.
+4. Вопрос `ticket ask` ждёт ответа, а сессии с ним нет (#457; живую сессию `session-run`
+   остановит её замок на шаге 1, сессию Claude Desktop замок не держит — второй `/start` при
+   живой координатор не даёт) — переход в рабочую копию плана и та же проверка ответа, что у
+   `ticket ask`: ответ участника в тикете после вопроса (владельца, координатора по записанному,
+   перенесённый координатором ответ владельца) — снимается метка `ready-for-human`; до маршрута —
+   полное задание режима /start с ответом впереди, на шаге маршрута — следующий шаг; второго
+   «продолжай» не нужно. Ответа нет — вопрос снова полным текстом, ответ из чата — в
+   `.ticket/reply.md` рабочей копии, затем `ticket ask N`.
 
 Внутри сессии тикета (`CANON_SESSION=ticket-N` на его ветке), которую запустил `session-run` после
 своего старта (метка `CANON_SESSION_MARK` совпала с файлом замка; под оркестратором — всегда),
@@ -47,6 +55,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import types
 from pathlib import Path
 
 TASK = """Режим /start: владелец может быть не у экрана. Сделай тикет по скиллу
@@ -144,19 +153,39 @@ def main(argv: list[str], core) -> int:
             "владельца в тикете забирает вызов из worktree тикета:"
         )
         return core.emit(core.TURN, f"Тикет #{n}: ответ владельца", body, (core.command("ask", n),))
-    if st["question"]:
-        body = (
-            f"{core.pending(st['question'])}Владелец ответил и написал «продолжай» — ответ из "
-            "чата дословно в `.ticket/reply.md`, затем вызов из worktree тикета:"
-        )
-        return core.emit(core.STOPPED, f"Тикет #{n}: ждём ответа", body, (core.command("ask", n),))
 
     plan = own_session(core, n)
     if plan is None:
         plan = prepare(core, n)
         if isinstance(plan, int):
             return plan
+    if st["question"] and plan["kind"] != "pr":
+        return resume_question(core, n, plan)
     return route(core, n, st, plan)
+
+
+def resume_question(core, n: int, plan: dict) -> int:
+    """Вопрос `ticket ask` ждёт ответа, а сессии с ним уже нет (#457): новый `/start N` прошёл
+    подготовку, переходит в рабочую копию плана и сам ищет ответ в тикете — той же проверкой,
+    что `ticket ask`. Ответ есть — без второго «продолжай»: до маршрута — полное задание режима
+    /start с ответом впереди (новая сессия прошлого задания не видела), на шаге маршрута —
+    следующий шаг `ticket ask`; нет — вопрос снова полным текстом, ответ из чата — в
+    `.ticket/reply.md` рабочей копии. Вопрос успели забрать, пока шла подготовка, — обычный
+    маршрут: старт не отправит отложенный `.ticket/ask.md` и не попросит новый вопрос."""
+    path = Path(__file__).resolve().parent / "ticket_ask.py"  # рядом, без `sys.path`
+    module = types.ModuleType("canon_ticket_ask_for_start")
+    module.__file__ = str(path)
+    exec(compile(path.read_text(encoding="utf-8"), str(path), "exec"), module.__dict__)
+    ask = module.Ask(n, core, root=Path(plan["worktree"]))
+    st = ask.state
+    if not st["question"]:
+        return route(core, n, st, plan)
+    status, title, body, commands = ask.wait(None)
+    st.save()
+    if status == core.TURN and st.step is None:
+        before = f"{module.ANSWER_HEAD}\n\n{core.quote(ask.answer)}\n\n"
+        return route(core, n, st, plan, before=before)
+    return core.emit(status, title, f"{enter(plan)}\n\n{body}", commands)
 
 
 def own_session(core, n: int) -> dict | None:
@@ -194,8 +223,8 @@ def prepare(core, n: int):
         raise core.Failure(f"session-start: нет итога JSON: {res.stdout[-200:]}") from None
 
 
-def route(core, n: int, st, plan: dict) -> int:
-
+def route(core, n: int, st, plan: dict, before: str = "") -> int:
+    """`before` — начало задания перед ним (ответ на вопрос, `resume_question`)."""
     if plan["kind"] == "pr":
         body = (
             f"Сначала PR автора: {plan['url']} — тикет #{n} отложен.\n{enter(plan)}\n"
@@ -208,10 +237,10 @@ def route(core, n: int, st, plan: dict) -> int:
             (core.command("start", n),),
         )
 
-    previous = ""
+    previous = before
     if url := merged_pr(core, st):
         st.retire(Path(plan["worktree"]))
-        previous = f"PR прошлого маршрута тикета уже слит ({url}) — работа по тикету заново.\n\n"
+        previous += f"PR прошлого маршрута тикета уже слит ({url}) — работа по тикету заново.\n\n"
     st["branch"] = plan["branch"]
     st.save()
     if st.step == "stopped" and core.orchestrated():
