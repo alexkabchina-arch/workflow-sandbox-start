@@ -2,7 +2,9 @@
 
     scripts/canon/ticket ship <N> [--again]
 
-Из worktree тикета (ветка `ticket-N` или `ticket-N-…`), когда работа закоммичена. Шаги по
+Из worktree тикета (ветка `ticket-N` или `ticket-N-…`), когда работа закоммичена; главная папка
+на ветке тикета, без рабочей копии, — остановка с путём рабочей копии (#458; не под
+оркестратором). Шаги по
 порядку; механику делает скрипт, на шаге с суждением печатает задание и выходит («ход агента»):
 
 | Шаг | Скрипт | Агент (файл в `.ticket/`) |
@@ -544,6 +546,8 @@ class Route:
         here = core.branch()
         if core.ticket_of(here) != self.n:
             return self.elsewhere(here)
+        if not core.orchestrated() and (main := self.main_folder()) is not None:
+            return self.in_main(main, here)
         self.root = core.toplevel()
         core.answers(self.root)
         st["branch"] = here
@@ -677,6 +681,28 @@ class Route:
                     core.gh("pr", "edit", number, "--remove-label", LABEL)
         except core.Failure as exc:
             core.say(f"ticket: метку {LABEL} снять не удалось — {exc}; сними руками")
+
+    def main_folder(self) -> Path | None:
+        """Главная папка проекта, если скрипт запущен из неё (первый worktree списка git)."""
+        listing = self.core.git("worktree", "list", "--porcelain").splitlines()
+        first = next((x[9:] for x in listing if x.startswith("worktree ")), None)
+        if first is None:
+            return None
+        main = Path(first).resolve()
+        return main if self.core.toplevel().resolve() == main else None
+
+    def in_main(self, main: Path, here: str) -> int:
+        """Главная папка на ветке тикета, без рабочей копии (#458, слабое место 6): маршрут не
+        идёт — в главной папке работают все сессии проекта, и правка тикета смешалась бы с ними."""
+        path = main / ".claude" / "worktrees" / f"ticket-{self.n}"
+        body = (
+            f"Главная папка {main} на ветке тикета {here}, рабочей копии у тикета нет: маршрут "
+            "из главной папки не идёт. Незакоммиченное — коммитом в ветку тикета; затем "
+            f"переключи главную папку на main (`git -C {main} switch main`) и старт тикета — "
+            f"рабочая копия будет {path}, маршрут — из неё. Вызов:"
+        )
+        start = self.core.command("start", self.n)
+        return self.core.emit(self.core.STOPPED, "Главная папка на ветке тикета", body, (start,))
 
     def elsewhere(self, here: str | None) -> int:
         path = self.core.worktree_of(self.n)
