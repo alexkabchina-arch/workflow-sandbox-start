@@ -122,15 +122,22 @@ def check(root: Path) -> list[str]:
                 "или файл переписан) — запустите canon-sync той же версии"
             )
 
-    own = "scripts/canon/check_lock.py" not in lock["files"]  # сам канон: скрипты не вендорятся
+    return problems + process_problems(root, lock["files"])
+
+
+def process_problems(root: Path, locked: dict) -> list[str]:
+    """Часть воркфлоу в `AGENTS.md` против `.claude/canon/process.md` установленной версии
+    (`locked` — файлы замка). Общая с хуком перед коммитом (`hooks/commit_checks.py`, #463)."""
+    own = "scripts/canon/check_lock.py" not in locked  # сам канон: скрипты не вендорятся
     part = normalized(root / PROCESS)
-    if PROCESS in lock["files"] and not (own and not part.startswith(PROCESS_BEGIN)):
-        if normalized(root / AGENTS).count(part) != 1:
-            problems.append(
-                f"{AGENTS}: часть воркфлоу не совпадает с {PROCESS} (правлена, удалена или файл "
-                "переписан) — запустите canon-sync той же версии"
-            )
-    return problems
+    if PROCESS not in locked or (own and not part.startswith(PROCESS_BEGIN)):
+        return []
+    if normalized(root / AGENTS).count(part) == 1:
+        return []
+    return [
+        f"{AGENTS}: часть воркфлоу не совпадает с {PROCESS} (правлена, удалена или файл "
+        "переписан) — запустите canon-sync той же версии"
+    ]
 
 
 def normalized(path: Path) -> str:

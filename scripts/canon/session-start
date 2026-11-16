@@ -52,7 +52,10 @@
    на сервере или с worktree — стоп с командой, как убрать. Новые коммиты поверх слитого head —
    обычная работа ветки (новый PR), их старт не трогает. Ветка PR подтягивается к серверу
    fast-forward; разошлась — стоп; на сервере её нет — сбой git. Потом проектная
-   `scripts/session/setup` в корне worktree, если есть.
+   `scripts/session/setup` в корне worktree, если есть, и стандартный хук перед коммитом (#463,
+   `hooks/commit_checks.py`): ставится в worktree, затем проверка, что git зовёт его и что
+   программы быстрых проверок профиля запускаются; нет — стоп с причиной (код 1), тикет не
+   занимается. Блока ```fast-checks в профиле нет — хук стоит, предупреждение в выводе.
    Перед worktree — уборка слитых PR (только если старт дошёл сюда): ветка `ticket-*`, которой
    нет на сервере и чей конец — head слитого PR или его предок (любым мёржем, и squash; head,
    которого нет локально, подтягивается `pull/<N>/head`), — её
@@ -121,6 +124,16 @@ def load_core() -> types.ModuleType:
 
 
 core = load_core()
+
+
+def load_hooks() -> types.ModuleType:
+    """`hooks/commit_checks.py` рядом — стандартный хук перед коммитом (#463)."""
+    path = HERE / "hooks" / "commit_checks.py"
+    module = types.ModuleType("canon_commit_checks_for_start")
+    module.__file__ = str(path)
+    exec(compile(path.read_text(encoding="utf-8"), str(path), "exec"), module.__dict__)
+    return module
+
 
 REGISTRY = "canon-sessions.json"
 # Worktree сессий — внутри главного чекаута: вход `EnterWorktree` с `path` сюда не ждёт клика.
@@ -1075,6 +1088,15 @@ def setup(worktree: Path) -> None:
         raise StartError(f"{SETUP} в {worktree}: код {code}: {output}")
 
 
+def commit_hook(worktree: Path) -> str:
+    """Стандартный хук перед коммитом (#463): поставить, проверить, что git зовёт его, и что
+    команды проверок запускаются; нет — стоп с причиной. Итог — строка для вывода."""
+    ready, line = load_hooks().prepare(worktree)
+    if not ready:
+        raise StartError(f"{worktree}: {line}")
+    return line
+
+
 # --- сборка ---
 
 
@@ -1124,6 +1146,7 @@ def start(number: int, claim=None, here: Path | None = None) -> dict:
         entries[str(worktree)] = {"session": plan["session"], "branch": plan["branch"]}
         write_registry(entries)
     setup(worktree)
+    plan["hook"] = commit_hook(worktree)
     if plan["kind"] == "ticket" and unmarked:
         mark_ticket(number)
     return plan
@@ -1141,6 +1164,7 @@ def report(plan: dict, outside: bool) -> str:
         f"  worktree  {plan['worktree']} (ветка {plan['branch']})",
         f"  сессия    CANON_SESSION={plan['session']}",
         f"  промпт    {plan['prompt']}",
+        f"  хук       {plan['hook']}",
         f"Запуск: cd {shlex.quote(plan['worktree'])} && CANON_SESSION={plan['session']} "
         f"claude -- {shlex.quote(plan['prompt'])}",
     ]
