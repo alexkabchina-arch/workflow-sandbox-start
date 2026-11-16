@@ -31,6 +31,13 @@
    «продолжай» не нужно. Ответа нет — вопрос снова полным текстом, ответ из чата — в
    `.ticket/reply.md` рабочей копии, затем `ticket ask N`.
 
+5. Маршрут остановлен (шаг `stopped`) — ответ владельца на отчёт об остановке ищется там, где он
+   ответил (#459, слабое место 8): комментарии участника в тикете и в открытом PR ветки после
+   своего отчёта (`ticket_core.after_report`, `report_answers`; ответ из чата, переданный
+   сессией, — тоже). Есть — задание сделать по нему и продолжить `ticket ship N --again`; нет —
+   «остановка»: ждём владельца, ответ из чата — в `.ticket/reply.md`. Черновой PR с отчётом —
+   та же ветка: подготовка берёт её, финиш вернёт PR из черновика.
+
 Внутри сессии тикета (`CANON_SESSION=ticket-N` на его ветке), которую запустил `session-run` после
 своего старта (метка `CANON_SESSION_MARK` совпала с файлом замка; под оркестратором — всегда),
 `session-start` не зовётся: старт уже сделан, замок — её собственный (#452), вход не нужен.
@@ -224,6 +231,70 @@ def prepare(core, n: int):
         raise core.Failure(f"session-start: нет итога JSON: {res.stdout[-200:]}") from None
 
 
+def report_answer(core, n: int, branch: str) -> tuple[str | None, str]:
+    """Ответ владельца на отчёт об остановке в тикете и открытом PR ветки (#459, слабое место
+    8) — цитатой для задания (пусто — ответа нет) и строка о черновом PR. Сбой `gh` — ответ
+    None со строкой о сбое: старт не обрывается, ответ прочтёт сессия сама."""
+    try:
+        pr = core.open_pr(branch)
+        answers = core.report_answers(core.after_report(n, branch, pr))
+    except core.Failure as exc:
+        read = f"`gh issue view {n} --comments` и комментарии PR ветки"
+        return None, f"Ответ владельца не прочитан ({exc}) — прочитай сам: {read}.\n"
+    draft = ""
+    if pr and pr.get("isDraft"):
+        draft = (
+            f"PR ветки — {pr['url']}, черновик с отчётом: работа продолжается в его ветке "
+            "(рабочая копия выше), финиш маршрута вернёт PR из черновика.\n"
+        )
+    return (core.quoted_answers(answers) if answers else ""), draft
+
+
+def stopped(core, n: int, st, plan: dict) -> int:
+    """Маршрут остановлен: следующий старт читает ответ владельца на отчёт там, где он ответил, —
+    в тикете или в PR (#459); черновой PR с отчётом — та же ветка. Ответ есть — задание сделать
+    по нему и продолжить (`--again`); нет — ждём владельца. Под оркестратором продолжает только
+    `agent:go` владельца — ответ, если он есть, впереди задания."""
+    where = (st["stop"] or {}).get("where", "?")
+    answer, note = report_answer(core, n, plan["branch"])
+    again = core.command("ship", n, "--again")
+    head = f"{enter(plan)}\nМаршрут был остановлен, отчёт об остановке — {where}.\n{note}"
+    said = f"Ответ владельца после отчёта (тикет и PR) —\n\n{answer}\n\n" if answer else ""
+    if answer is None:  # не прочитан: «ответа нет» было бы неправдой — читает сессия
+        body = (
+            f"{head}Ответ есть — сделай по нему (правки — коммитами с сообщением одной строкой "
+            f"`-m`); нет — ждём владельца, вызов не делать. Продолжить маршрут из worktree тикета, "
+            f"задания — до {core.until()} ({core.LONG_CALL}):"
+        )
+        return core.emit(core.TURN, f"Тикет #{n}: продолжение после остановки", body, (again,))
+    if core.orchestrated():
+        read = (
+            said + "По ответу и иди."
+            if answer
+            else "Ответа комментарием после отчёта нет — владелец поставил agent:go: иди по отчёту."
+        )
+        body = (
+            f"{head}{read} Затем продолжить маршрут из worktree тикета, задания — до "
+            f"{core.until()} ({core.LONG_CALL}):"
+        )
+        return core.emit(core.TURN, f"Тикет #{n}: продолжение после остановки", body, (again,))
+    if answer:
+        body = (
+            f"{head}{said}Сделай по ответу (правки — коммитами с сообщением одной строкой `-m`; "
+            f"новый вопрос владельцу — через `ticket ask {n}`), затем продолжить маршрут из "
+            f"worktree тикета, задания — до {core.until()} ({core.LONG_CALL}):"
+        )
+        return core.emit(core.TURN, f"Тикет #{n}: ответ на отчёт об остановке", body, (again,))
+    body = (
+        f"{head}Ответа владельца после отчёта ни в тикете, ни в PR нет — ждём владельца: он "
+        "отвечает комментарием в тикете или в PR (можно с телефона) или в чате. Ответ из чата — "
+        "дословно в файл `.ticket/reply.md` (Write): маршрут передаст его в тикет (решение о "
+        "/verify — только комментарием владельца). Ответил — "
+        "продолжить маршрут из worktree тикета:"
+    )
+    return core.emit(core.STOPPED, f"Тикет #{n}: остановка", body, (again,))
+
+
 def route(core, n: int, st, plan: dict, before: str = "") -> int:
     """`before` — начало задания перед ним (ответ на вопрос, `resume_question`)."""
     if plan["kind"] == "pr":
@@ -244,29 +315,8 @@ def route(core, n: int, st, plan: dict, before: str = "") -> int:
         previous += f"PR прошлого маршрута тикета уже слит ({url}) — работа по тикету заново.\n\n"
     st["branch"] = plan["branch"]
     st.save()
-    if st.step == "stopped" and core.orchestrated():
-        # Оркестратор возобновляет остановленный тикет только по `agent:go` владельца.
-        where = (st["stop"] or {}).get("where", "?")
-        # Ответ на отчёт маршрут сам не читает (#289): отчёт в PR — и ответ под ним.
-        read = f"`gh issue view {n} --comments`"
-        if "/pull/" in where:
-            read += f" и `gh pr view {where} --comments`"
-        body = (
-            f"{enter(plan)}\nМаршрут был остановлен, отчёт об остановке — {where}; владелец "
-            f"поставил agent:go. Сначала прочитай комментарии владельца после отчёта об "
-            f"остановке ({read}): в них его ответ — по нему и иди. Затем продолжить маршрут из "
-            f"worktree тикета, задания — до {core.until()} ({core.LONG_CALL}):"
-        )
-        again = core.command("ship", n, "--again")
-        return core.emit(core.TURN, f"Тикет #{n}: продолжение после остановки", body, (again,))
     if st.step == "stopped":
-        where = (st["stop"] or {}).get("where", "?")
-        body = (
-            f"{enter(plan)}\nМаршрут остановлен, отчёт об остановке — {where}. Владелец ответил "
-            "«продолжай» — продолжить маршрут из worktree тикета:"
-        )
-        again = core.command("ship", n, "--again")
-        return core.emit(core.STOPPED, f"Тикет #{n}: остановка", body, (again,))
+        return stopped(core, n, st, plan)
     if st.step is not None:
         name = core.STEP_NAMES.get(st.step, st.step)
         body = (

@@ -81,9 +81,10 @@ ERROR_SUMMARY = re.compile(r"^(?:FAILED|ERROR|FAIL:|ERROR:)\s+\S")
 NOT_ERROR = re.compile(r"^(?:export\s+)?[A-Za-z_][A-Za-z0-9_]*=|^[=\-_*#\s]+\w[\w ]*[=\-_*#\s]+$")
 RUN_LOG_END = re.compile(r"^run-log: завершено с кодом \S+ · лог: ")
 # Пароль в URL строки ошибки (`postgresql://u:pass@db`, `redis://:pass@host`) — маской до
-# отчёта на GitHub (#283): схема, логин и хост остаются, пароль — `***`.
-# Пароль — до последнего `@` в слове: в нём бывают `/` и `@`; лишнее под маской не вредит.
-URL_PASSWORD = re.compile(r"(\b[A-Za-z][A-Za-z0-9+.-]*://[^\s/:@]*:)\S+(@)")
+# отчёта на GitHub (#283): схема, логин и хост остаются, пароль — `***`. Копия
+# `ticket_core.URL_PASSWORD` (#446: любой символ перед схемой, `@` в логине) — функции модуля
+# зовут и без `core`; весь отчёт об остановке ещё раз проходит `core.mask`.
+URL_PASSWORD = re.compile(r"(?<![A-Za-z0-9+.-])([A-Za-z][A-Za-z0-9+.-]*://[^\s/:]*:)\S+(@)")
 TRACE = "verify: /verify оставил в рабочем дереве"  # след /verify; при коде 1 — в stderr
 # `/verify` вернул BLOCKED (#292): строка `verify` в stderr, отчёт — `verify.raw.md`. Причина —
 # из строки вердикта отчёта («**Verdict:** BLOCKED. …»; после BLOCKED пусто — следующая строка),
@@ -92,7 +93,8 @@ TRACE = "verify: /verify оставил в рабочем дереве"  # сл�
 BLOCKED_MARK = "/verify не смог проверить (BLOCKED)"
 BLOCKED_REASON = re.compile(r"\bBLOCKED\b[\s*_.:;,—–-]*(.*)")
 MARKDOWN = re.compile(r"^(?:[#>\s]+|[-*+]\s+|\d+[.)]\s+)+|\*\*")
-ASSIGNMENT = re.compile(r"\b([A-Za-z_][A-Za-z0-9_]*=)\S+")
+# Значение в кавычках — целиком, с пробелами (#294 п. 3: `PGPASSWORD="my secret pass"`).
+ASSIGNMENT = re.compile(r"""\b([A-Za-z_][A-Za-z0-9_]*=)(?:"[^"\n]*"|'[^'\n]*'|\S+)""")
 ANSI = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
 CANON_REPO = "alexkabchina-arch/workflow"
 LABEL = "ready-for-human"
@@ -247,6 +249,19 @@ CHECKS_TASK = """Реши, чья вина, и почини — без вопр�
 Полный вывод — в логе из строки `run-log: завершено …`; длинный лог читать через docs-scout, не
 целиком."""
 
+# Строки `secrets` нет ни в профиле основной ветки, ни в ветке (#459): ветку не отправить.
+NO_SECRETS = (
+    "error: проверки `secrets` нет ни в {profile} основной ветки, ни в ветке — допиши строку "
+    "`secrets` в блок ```checks профиля ветки (образец — шаблон профиля воркфлоу)"
+)
+# Красный `secrets` с находкой (#459): не «почини», а вопрос владельцу — задание отчёта об
+# остановке. Сбой самой проверки (нет gitleaks, нет `origin/main`) — обычная починка.
+SECRETS_STOP = """Секрет в ветке — не чинить и не глушить: ни коммитом поверх (ключ остаётся в
+истории), ни `.gitleaksignore`, `gitleaks:allow`, правкой `.gitleaks.toml` или профиля; ветку не
+отправлять. Вопрос владельцу: ключ настоящий (отозвать его — дело владельца; неотправленные
+коммиты ветки переписать без ключа) или ложная тревога (правило в `.gitleaks.toml` основной ветки
+правит владелец) — с рекомендацией (`docs/secrets.md` воркфлоу)."""
+
 RERUN_ADMISSION = "Следующий вызов перегонит только упавшие проверки допуска."
 RERUN_RETEST = "Следующий вызов перегонит тесты, задетые починкой, перед /verify."
 RERUN_GATES = (
@@ -336,18 +351,31 @@ def load_review() -> types.ModuleType:
     return load_script("review")
 
 
-def admission_checks(core, profile: Path) -> list[tuple[str, list[str]]]:
+def admission_checks(core, root: Path) -> list[tuple[str, list[str]]]:
     """Список допуска (#465): строки ```fast-checks профиля — список хука, — затем строки
     ```checks; одноимённая строка ```checks заменяет строку хука: она для ветки целиком (секреты
     по коммитам ветки, формат проверкой, а не правкой). Блока ```checks нет — `Failure`, как у
-    `profile_checks`."""
+    `profile_checks`. Строка `secrets` — из ```checks профиля основной ветки (#459): ветка не
+    уберёт и не подменит её своим профилем; там её нет — строка ветки (`trusted_secrets`, одна
+    политика с хуком и `ship-finish`); нет нигде, а профиль в основной ветке есть, — красная
+    проверка с заданием дописать строку в профиль ветки: `ship-finish` без неё ветку не отправит,
+    и ревью не оплачивается зря."""
+    profile = root / PROFILE
     checks = core.profile_checks(profile)
     try:
         fast = core.fast_checks(profile.read_text(encoding="utf-8"), profile) or []
     except OSError:
         fast = []
     names = {name for name, _ in checks}
-    return [(name, argv) for name, argv in fast if name not in names] + checks
+    listed = [(name, argv) for name, argv in fast if name not in names] + checks
+    listed = [(name, argv) for name, argv in listed if name != core.SECRETS]
+    secrets, where = core.trusted_secrets(root, PROFILE)
+    if secrets is None and where:
+        said = NO_SECRETS.format(profile=PROFILE)
+        secrets = [sys.executable, "-c", f"import sys; print({said!r}); sys.exit(1)"]
+    if secrets is not None:
+        listed.append((core.SECRETS, secrets))
+    return listed
 
 
 def tail(text: str, lines: int = 20) -> str:
@@ -626,6 +654,7 @@ class Route:
                 step = "finish"
             if self.stopped_on_verify() and (out := self.waive_verify()) is not None:
                 return core.emit(*out)  # шаг «остановка» как был: повтор `--again` пойдёт дальше
+            self.relay_stop_reply()
             st.go(step)
             st["stop"] = None
             self.unmark()
@@ -684,31 +713,26 @@ class Route:
         )
         return (core.TURN, "Ответ из чата не принимается", body, (f"{self.cmd} --again",))
 
-    def after_report(self) -> list[dict]:
-        """Комментарии тикета и открытого PR ветки после последнего отчёта об остановке в каждом:
-        граница — сам отчёт, не часы машины. Где отчёта нет — оттуда ничего. Отчёт — только от
-        своих (`trusted`), как у Stop-хука и `session-start`: «Отчёт об остановке» постороннего
-        сдвинул бы границу за решение владельца (#249). Скрытый свой отчёт — тоже граница:
-        владелец прячет отработанный отчёт, а остановка от этого не раньше. Сбой сверки автора
-        — `Failure`, код 1 без перехода: «не свой» молча пустил бы платный `/verify`."""
-        core, n = self.core, str(self.n)
-        fields = ["--state", "open", "--json", "number"]
-        prs = core.gh_json("pr", "list", "--head", self.state["branch"], *fields) or []
-        sources = [("issue", n)] + [("pr", str(pr["number"])) for pr in prs[:1]]
-        found = []
-        for kind, ref in sources:
-            said = (core.gh_json(kind, "view", ref, "--json", "comments") or {}).get("comments")
-            said = said or []
-            at = next((i for i in reversed(range(len(said))) if self.own_report(said[i])), None)
-            if at is not None:
-                found += said[at + 1 :]
-        return found
+    def relay_stop_reply(self) -> None:
+        """Ответ владельца на отчёт из чата (`.ticket/reply.md`) — комментарием в тикет, после
+        отчёта (#459): следующий старт найдёт его там же, где ответ из GitHub. Под оркестратором
+        чата нет — файл не ответ; решение о `/verify` разбирает `waive_verify` раньше. Сбой `gh`
+        — строкой в выводе: маршрут идёт, ответ остаётся в состоянии."""
+        core = self.core
+        reply = core.read_answer(self.root, "reply.md")
+        if not reply or core.orchestrated():
+            return
+        try:
+            core.relay_reply(self.n, reply)
+        except core.Failure as exc:
+            core.say(f"ticket: ответ из чата в тикет не передан — {exc}")
+        core.keep(self.state, self.root / core.ANSWERS / "reply.md", f"reply-{core.now()}.md")
 
-    def own_report(self, comment: dict) -> bool:
-        """Комментарий — отчёт об остановке от своих: участника или App."""
-        if not REPORT.match(comment.get("body") or ""):
-            return False
-        return self.core.trusted(comment, strict=True)
+    def after_report(self) -> list[dict]:
+        """Комментарии тикета и открытого PR ветки после последнего отчёта об остановке
+        (`ticket_core.after_report`); сбой сверки автора — `Failure`, код 1 без перехода: «не
+        свой» молча пустил бы платный `/verify`."""
+        return self.core.after_report(self.n, self.state["branch"])
 
     def unmark(self) -> None:
         """Метка остановки — с тикета и открытого PR ветки: владелец ответил «продолжай», ждать
@@ -1070,7 +1094,7 @@ class Route:
             return None
         current = core.head()
         passed = {r["name"]: r for r in (st["admission"] or {}).get("passed", [])}
-        listed = admission_checks(core, self.root / PROFILE)
+        listed = admission_checks(core, self.root)
         fresh, files = [], None
         for name, argv in listed:
             if name in passed:
@@ -1109,8 +1133,13 @@ class Route:
         return "review"
 
     def red_checks(self, red: list[dict], title: str, rerun: str):
-        """Красные проверки: задание починить; третий круг — остановка."""
+        """Красные проверки: задание починить; третий круг — остановка. Красный `secrets` —
+        сразу остановка с вопросом владельцу, без «почини» (#459, слабое место 7): коммит поверх
+        ключ не убирает, а `.gitleaksignore`, `gitleaks:allow` и правка профиля глушат защиту."""
         st = self.state
+        if leaked := [r for r in red if r["name"] == self.core.SECRETS and r.get("leaked")]:
+            said = leaked[0].get("error") or f"код {leaked[0]['code']}"
+            return self.stop(f"красная проверка `secrets`: {said}", hint=SECRETS_STOP)
         attempt = st.attempt("checks")
         names = ", ".join(f"`{r['name']}` — код {r['code']}" for r in red)
         if attempt > LIMIT:
@@ -1155,12 +1184,16 @@ class Route:
                 pass
         # Без значений секретов gitleaks (#258): строка ошибки уходит в отчёт на GitHub.
         hide = core.without_secret_fields
+        error, leaked = first_error(hide(output)), False
+        if name == core.SECRETS and code != 0 and (found := core.secret_findings(output)):
+            error, leaked = core.leaks_line(found), True  # файл и строка — без значения
         return {
             "name": name,
             "code": code,
             "log": log.group(1) if log else None,
             "tail": tail(hide(shown), 30),
-            "error": first_error(hide(output)),
+            "error": error,
+            **({"leaked": True} if leaked else {}),
             **({"selected": selection} if selection is not None else {}),
         }
 
@@ -1808,10 +1841,13 @@ class Route:
 
     # --- остановка ---
 
-    def stop(self, reason: str, trace: dict | None = None):
-        """Остановка; `trace` — след `/verify` в worktree (строка и head до прогона)."""
+    def stop(self, reason: str, trace: dict | None = None, hint: str = ""):
+        """Остановка; `trace` — след `/verify` в worktree (строка и head до прогона), `hint` —
+        о чём вопрос владельцу (красный `secrets`)."""
         st = self.state
         st["stop"] = {"reason": reason, "step": st.step, "trace": trace}
+        if hint:
+            st["stop"]["hint"] = hint
         st.go("stop")
         return self.step_stop()
 
@@ -1825,6 +1861,8 @@ class Route:
                 if trace
                 else ""
             )
+            hint = st["stop"].get("hint")
+            first += f"{hint}\n" if hint else ""
             return self.turn(
                 "Отчёт об остановке",
                 f"Довести нельзя: {reason}.\n{first}Допиши для владельца в `.ticket/stop.md`: "
@@ -1894,7 +1932,9 @@ class Route:
                 lines.append(f"- `{r['name']}` — код {r['code']}, {said}")
         total = sum(v for v in st["cost"].values() if isinstance(v, (int, float)))
         lines.append(f"- Расход: {total:.2f} USD")
-        return self.local_paths("\n".join(lines) + "\n")
+        # Маска — на весь текст (#446): вопрос сессии и строки ошибок уходят на GitHub, а
+        # секрет в комментарии остаётся в истории его правок.
+        return self.core.mask(self.local_paths("\n".join(lines) + "\n"))
 
     def publish_stop(self, text: str, saved: Path) -> str:
         """`ship-finish --unconfirmed`; не прошёл — то же кодом, без `gh pr merge` (#152):
