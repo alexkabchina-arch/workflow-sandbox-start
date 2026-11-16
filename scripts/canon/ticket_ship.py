@@ -9,19 +9,32 @@
 
 | Шаг | Скрипт | Агент (файл в `.ticket/`) |
 |---|---|---|
+| допуск | `fast-checks` и `checks` (`run-log`), `{files}` — файлы ветки | починка (`checks.md`) |
 | ревью ошибок | `review`, отчёт рядом с состоянием; «только документы» — без разбора | — |
 | разбор | находки и правило разбора | решения, исправления (`findings.md`) |
 | проверка разбора | все разобраны; тикеты техдолга и канона — сам | ответ владельца (`answer.md`) |
-| тесты и линтеры | блок `checks` через `run-log`, `{files}` — файлы ветки | починка (`checks.md`) |
+| тесты исправлений | `tests` по файлам починки — только перед `/verify` | починка (`checks.md`) |
 | `/verify` | критерии из тикета и его комментариев, `verify`, итог | FAIL — починить |
 | догон базы | `git merge origin/main` | конфликт — разрешить (`sync.md`) |
 | тело PR | факты: Closes, тесты, ревью, `/verify`, догон | «Что сделано» (`summary.md`) |
 | финиш | `ship-finish`: push, PR, авто-мёрж, отметка ревью | привязка PR, Auto-fix, `ticket wait` |
 | остановка | отчёт из данных, `ready-for-human` | вопрос и варианты (`stop.md`) |
 
+Проверки — по решению владельца 30.10 (#465, `docs/decisions/2026-10-30-checks-on-start-path.md`):
+допуск — один раз до платного ревью: строки ```fast-checks профиля (список хука; одноимённая
+строка ```checks заменяет строку хука) и строки ```checks (задетые тесты, миграции, документация
+API); упало — после починки перегоняются только упавшие. Починка после допуска (находки, FAIL
+`/verify`, красный CI, красные ворота, поздний коммит) — шаг «тесты исправлений»: строка `tests`
+по файлам своих коммитов починки (без коммитов слияния), и только если дальше `/verify`; без
+`/verify` их проверяют CI или ворота. `/verify` после PASS повторяется, только если починка
+задела код приложения — не документы и не тесты (шаблоны `tests` блока ```affected-tests). После
+догона базы и тела PR проверки не повторяются — стык проверяет CI. Полного набора тестов в
+маршруте нет.
+
 Пределы — два круга исправлений каждого вида (красные проверки, FAIL `/verify`, догон), третий —
-остановка. Новые коммиты после финиша (красный CI, конфликт) — тот же вызов: проверки, догон и
-отметка на новый head без второго ревью; PR уже слит — маршрут с нуля (новая работа, новый PR).
+остановка. Новые коммиты после финиша (красный CI, конфликт) — тот же вызов: тесты исправлений
+перед `/verify`, догон и отметка на новый head без второго ревью; PR уже слит — маршрут с нуля
+(новая работа, новый PR).
 Под оркестратором (`CANON_ORCHESTRATOR=1`, #214) ревью ошибок сессия не гоняет: без отчёта —
 «код готов» (head в состоянии, шаг `ready`), отчёт кладёт оркестратор; финиш — `ship-finish
 --pr-only` (push и PR без авто-мёржа и отметки) и снова «код готов». Отметку ставит оркестратор.
@@ -230,8 +243,19 @@ CHECKS_TASK = """Реши, чья вина, и почини — без вопр�
   `.ticket/checks.md` (уйдёт в тело PR);
 - линтер или формат красный только на файлах вне диффа (обновился инструмент) — не чинить:
   вопрос и варианты в `.ticket/stop.md`.
-Попытка {attempt} из {limit}; дальше — отчёт об остановке. Полный вывод — в логе из строки
-`run-log: завершено …`; длинный лог читать через docs-scout, не целиком."""
+Попытка {attempt} из {limit}; дальше — отчёт об остановке. {rerun}
+Полный вывод — в логе из строки `run-log: завершено …`; длинный лог читать через docs-scout, не
+целиком."""
+
+RERUN_ADMISSION = "Следующий вызов перегонит только упавшие проверки допуска."
+RERUN_RETEST = "Следующий вызов перегонит тесты, задетые починкой, перед /verify."
+RERUN_GATES = (
+    "Следующий вызов — тесты, задетые починкой, только если дальше /verify; ворота на финише "
+    "перегонят всё сами."
+)
+# Проверка хука по индексу коммита (`git diff --cached`, `gitleaks --staged`): в допуске индекс
+# пуст — она ничего не проверяет, и зелёный итог был бы ложным (#465).
+INDEX_ARGS = ("--cached", "--staged")
 
 CONFLICT_TASK = """Ветка догоняет origin/main мёржем (не rebase: отчёт ревью должен остаться
 предком HEAD) — конфликт в файлах: {files}.
@@ -298,13 +322,32 @@ def selected(path: Path) -> dict | None:
     return {"files": files, "tests": tests}
 
 
-def load_review() -> types.ModuleType:
-    """`review` рядом со скриптом — его `is_docs` и `needs_review`: пропуск тем же правилом."""
-    path = Path(__file__).resolve().parent / "review"
-    module = types.ModuleType("canon_review_for_ticket")
+def load_script(name: str) -> types.ModuleType:
+    """Скрипт канона рядом (файл без `.py`) модулем."""
+    path = Path(__file__).resolve().parent / name
+    module = types.ModuleType(f"canon_{name.replace('-', '_')}_for_ticket")
     module.__file__ = str(path)
     exec(compile(path.read_text(encoding="utf-8"), str(path), "exec"), module.__dict__)
     return module
+
+
+def load_review() -> types.ModuleType:
+    """`review` рядом со скриптом — его `is_docs` и `needs_review`: пропуск тем же правилом."""
+    return load_script("review")
+
+
+def admission_checks(core, profile: Path) -> list[tuple[str, list[str]]]:
+    """Список допуска (#465): строки ```fast-checks профиля — список хука, — затем строки
+    ```checks; одноимённая строка ```checks заменяет строку хука: она для ветки целиком (секреты
+    по коммитам ветки, формат проверкой, а не правкой). Блока ```checks нет — `Failure`, как у
+    `profile_checks`."""
+    checks = core.profile_checks(profile)
+    try:
+        fast = core.fast_checks(profile.read_text(encoding="utf-8"), profile) or []
+    except OSError:
+        fast = []
+    names = {name for name, _ in checks}
+    return [(name, argv) for name, argv in fast if name not in names] + checks
 
 
 def tail(text: str, lines: int = 20) -> str:
@@ -568,10 +611,10 @@ class Route:
         core.answers(self.root)
         st["branch"] = here
         if st.step is None:
-            st.go("review")
+            st.go("checks")  # допуск — до платного ревью (#465)
         if again and st.step == "stopped":
             st["attempts"], st["wait"] = {}, None  # владелец ответил — круги и ожидания заново
-            step = (st["stop"] or {}).get("step") or "review"
+            step = (st["stop"] or {}).get("step") or "checks"
             # Отчёт об остановке после финиша перевёл открытый PR в черновик и выключил авто-мёрж
             # — снова финиш, как после остановки `ticket wait`: `ship-finish` вернёт то и другое
             # (#190, п. 1). Слит (владелец слил черновик сам) — шаг «готово» как есть: итог или,
@@ -595,9 +638,11 @@ class Route:
 
     def stopped_on_verify(self) -> bool:
         """Остановка на `/verify`: на его шаге (BLOCKED, FAIL сверх предела, нет критериев) или
-        сессией на починке после его FAIL («починить нельзя» — `stop.md` на шаге проверок)."""
+        сессией на починке после его FAIL («починить нельзя» — `stop.md` на шаге тестов
+        исправлений)."""
         stop, decision = self.state["stop"] or {}, self.state["verify"] or {}
-        failed = stop.get("step") == "checks" and decision.get("verdict") == "FAIL"
+        repairing = stop.get("step") == "retest"
+        failed = repairing and decision.get("verdict") == "FAIL"
         return stop.get("step") == "verify" or failed
 
     def waive_verify(self):
@@ -775,9 +820,11 @@ class Route:
                 # PR слит, а в ветке новые коммиты — новая работа: маршрут с нуля, а отчёт ревью
                 # покрывает только код слитого PR (#190, п. 5).
                 st.retire(self.root)
-                st.go("review")
+                st.go("checks")
                 return None
-            st.go("checks")  # новые коммиты после финиша: проверки и отметка на новый head
+            # Новые коммиты после финиша (красный CI, ворота): тесты исправлений перед /verify,
+            # догон и отметка на новый head (#465).
+            st.go("retest")
             return None
         if st.step not in ("stop", "sync") and self.dirty():
             return self.turn(
@@ -841,7 +888,6 @@ class Route:
         core, st = self.core, self.state
         verdict = self.reviewed()
         if verdict is None and core.orchestrated():
-            core.profile_checks(self.root / PROFILE)  # профиль без проверок — до оплаты ревью
             return self.ready(reviewed=False)  # ревью ошибок гоняет оркестратор вне сессии
         if verdict is not None and core.orchestrated():
             if (st["review"] or {}).get("head") != verdict["head"]:  # новый отчёт оркестратора
@@ -850,7 +896,6 @@ class Route:
                 st["asked"] = st["decisions"] = None
                 st["cost"]["review"] = verdict.get("cost_usd") or 0
         if verdict is None:
-            core.profile_checks(self.root / PROFILE)  # профиль без проверок — до оплаты ревью
             st.dir.mkdir(parents=True, exist_ok=True)
             for old in ("findings.md", "answer.md"):  # ответы прошлого ревью к новому не относятся
                 (self.root / core.ANSWERS / old).unlink(missing_ok=True)
@@ -879,7 +924,7 @@ class Route:
         if st["review"]["skipped"]:
             why = "чистая установка канона" if st["review"]["install"] else "только документы"
             st["verify"] = {"needed": False, "why": why}
-            st.go("checks")
+            st.go("retest")
             return None
         st.go("findings")
         return self.findings_task()
@@ -932,7 +977,7 @@ class Route:
             self.file_issues(decisions)
         except core.Failure as exc:
             return self.stop(f"тикет по находкам не заведён: {exc}")
-        st.go("checks")
+        st.go("retest")  # исправления по находкам — их тесты, только перед /verify (#465)
         return None
 
     def file_issues(self, decisions: dict[int, tuple[str, str]]) -> None:
@@ -1014,83 +1059,215 @@ class Route:
                 paths.append(prefix + path)
         return paths
 
-    # --- тесты и линтеры ---
+    # --- допуск ---
 
     def step_checks(self):
+        """Допуск до ревью (#465): один раз на маршрут, список — `admission_checks`. Упало —
+        после починки перегоняются только упавшие: прошедшие лежат в `admission.passed`."""
         core, st = self.core, self.state
-        if self.reviewed() is None:  # код после пропуска «только документы», ветка переписана
-            st.go("review")
+        if st["checks"]:  # допуск пройден — один раз на маршрут
+            st.go(self.after_admission())
             return None
         current = core.head()
-        green = st["checks"]
-        if green and green["head"] == current:
-            st.go("verify")
-            return None
-        docs_since = bool(green) and self.docs_only_since(green["head"])
-        results, files = [], None
-        for name, argv in core.profile_checks(self.root / PROFILE):
-            if docs_since and name == "tests":
-                note = f"не повторялся: после `{green['head'][:7]}` — только документы"
-                kept = {"name": name, "code": 0, "note": note}
-                # Отбор прошлого прогона — дальше: по нему `ticket wait` ловит промах (#464).
-                prior = next((r for r in green["results"] if r["name"] == name), {})
-                if prior.get("selected"):
-                    kept["selected"] = prior["selected"]
-                results.append(kept)
+        passed = {r["name"]: r for r in (st["admission"] or {}).get("passed", [])}
+        listed = admission_checks(core, self.root / PROFILE)
+        fresh, files = [], None
+        for name, argv in listed:
+            if name in passed:
                 continue
-            if any(core.FILES_ARG.match(a) for a in argv):  # задетые тесты и т.п. (#464)
+            if any(a in INDEX_ARGS for a in argv):
+                note = "пропущена: проверяет индекс коммита, в допуске он пуст"
+                fresh.append({"name": name, "code": 0, "note": note})
+                continue
+            if any(core.FILES_ARG.match(a) for a in argv):
                 files = core.branch_files() if files is None else files
-                argv = core.expand_files(argv, files)
-                if argv is None:
-                    note = "пропущена: подходящих изменённых файлов нет"
-                    results.append({"name": name, "code": 0, "note": note})
-                    continue
-            core.say(f"ticket: {name} …")
-            if name == "secrets":  # помощник — копия рядом, а не файл ветки (#283)
-                argv = core.canon_secrets(argv, core.HERE)
-            if Path(argv[0]).name != "run-log":
-                argv = [sys.executable, str(core.HERE / "run-log"), "-l", name, "--", *argv]
-            # Отбор задетых тестов команда пишет сюда: по нему `ticket wait` ловит промах (#464).
-            st.dir.mkdir(parents=True, exist_ok=True)
-            picked = st.dir / f"affected-{re.sub(r'[^A-Za-z0-9_-]+', '-', name)}.json"
-            picked.unlink(missing_ok=True)
-            env = {**os.environ, core.AFFECTED_OUT: str(picked)}
-            res = core.run(*argv, cwd=self.root, env=env)
-            selection = selected(picked)
-            log = re.search(r"лог: (\S+)", res.stdout)
-            output = res.stdout + res.stderr
-            if res.returncode != 0 and log:  # строка ошибки — из полного лога, не из хвоста
-                try:
-                    output = Path(log.group(1)).read_text(encoding="utf-8", errors="replace")
-                except OSError:
-                    pass
-            # Без значений секретов gitleaks (#258): строка ошибки уходит в отчёт на GitHub.
-            hide = core.without_secret_fields
-            results.append(
-                {
-                    "name": name,
-                    "code": res.returncode,
-                    "log": log.group(1) if log else None,
-                    "tail": tail(hide(res.stdout + res.stderr), 30),
-                    "error": first_error(hide(output)),
-                    **({"selected": selection} if selection is not None else {}),
-                }
-            )
-        st["checks_run"] = {"head": current, "results": [self.brief(r) for r in results]}
-        red = [r for r in results if r["code"] != 0]
+            fresh.append(self.run_check(name, argv, files))
+        for r in fresh:
+            r["head"] = current  # круги допуска — на разных head: тело PR называет каждый
+            if r["code"] == 0:
+                passed[r["name"]] = self.brief(r)
+        order = [name for name, _ in listed]
+        known = {**passed, **{r["name"]: self.brief(r) for r in fresh}}
+        results = [known[name] for name in order if name in known]
+        st["admission"] = {"passed": [passed[n] for n in order if n in passed]}
+        st["checks_run"] = {"head": current, "results": results}
+        red = [r for r in fresh if r["code"] != 0]
         if not red:
-            st["checks"] = st["checks_run"]
+            st["checks"] = {**st["checks_run"], "admitted": current}
+            st["tested"] = current
             st["attempts"].pop("checks", None)
-            st.go("verify")
+            st.go(self.after_admission())
             return None
+        return self.red_checks(red, "Допуск до ревью: красные проверки", RERUN_ADMISSION)
+
+    def after_admission(self) -> str:
+        """Шаг после допуска: ревью; отчёт ревью этого маршрута уже есть и годен — тесты
+        исправлений. Так идёт состояние до #465, где шаг `checks` стоял после разбора: повторный
+        разбор того же отчёта затёр бы решение о /verify и его PASS."""
+        if self.state["review"] and self.reviewed() is not None:
+            return "retest"
+        return "review"
+
+    def red_checks(self, red: list[dict], title: str, rerun: str):
+        """Красные проверки: задание починить; третий круг — остановка."""
+        st = self.state
         attempt = st.attempt("checks")
         names = ", ".join(f"`{r['name']}` — код {r['code']}" for r in red)
         if attempt > LIMIT:
-            return self.stop(f"тесты и линтеры красные {attempt}-й раз: {names}")
-        st.go("checks")
+            return self.stop(f"проверки красные {attempt}-й раз: {names}")
+        st.go(st.step)
         shown = "\n\n".join(f"`{r['name']}` — код {r['code']}:\n{r['tail']}" for r in red)
-        body = f"{shown}\n\n{CHECKS_TASK.format(attempt=attempt, limit=LIMIT)}"
-        return self.turn("Красные тесты или линтеры", body, long="тесты — до 45 минут")
+        task = CHECKS_TASK.format(attempt=attempt, limit=LIMIT, rerun=rerun)
+        return self.turn(title, f"{shown}\n\n{task}", long="тесты — до 45 минут")
+
+    def run_check(self, name: str, argv: list[str], files: list[str] | None) -> dict:
+        """Одна проверка через `run-log`: `{files}` — `files`; итог с хвостом вывода, строкой
+        ошибки и отбором задетых тестов (#464). Проверка, изменившая отслеживаемые файлы рабочей
+        копии (форматер в режиме правки), — красная: правка не уходит в ветку молча, как у хука."""
+        core, st = self.core, self.state
+        if any(core.FILES_ARG.match(a) for a in argv):  # задетые тесты и т.п. (#464)
+            argv = core.expand_files(argv, files or [])
+            if argv is None:
+                return {"name": name, "code": 0, "note": "пропущена: подходящих файлов нет"}
+        core.say(f"ticket: {name} …")
+        if name == "secrets":  # помощник — копия рядом, а не файл ветки (#283)
+            argv = core.canon_secrets(argv, core.HERE)
+        if Path(argv[0]).name != "run-log":
+            argv = [sys.executable, str(core.HERE / "run-log"), "-l", name, "--", *argv]
+        # Отбор задетых тестов команда пишет сюда: по нему `ticket wait` ловит промах (#464).
+        st.dir.mkdir(parents=True, exist_ok=True)
+        picked = st.dir / f"affected-{re.sub(r'[^A-Za-z0-9_-]+', '-', name)}.json"
+        picked.unlink(missing_ok=True)
+        env = {**os.environ, core.AFFECTED_OUT: str(picked)}
+        before = self.dirty()
+        res = core.run(*argv, cwd=self.root, env=env)
+        selection = selected(picked)
+        log = re.search(r"лог: (\S+)", res.stdout)
+        shown = output = res.stdout + res.stderr
+        code = res.returncode
+        if code == 0 and (after := self.dirty()) != before:
+            code = 1
+            shown = output = f"{output}\nпроверка изменила файлы рабочей копии:\n{after}\n"
+        elif code != 0 and log:  # строка ошибки — из полного лога, не из хвоста
+            try:
+                output = Path(log.group(1)).read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                pass
+        # Без значений секретов gitleaks (#258): строка ошибки уходит в отчёт на GitHub.
+        hide = core.without_secret_fields
+        return {
+            "name": name,
+            "code": code,
+            "log": log.group(1) if log else None,
+            "tail": tail(hide(shown), 30),
+            "error": first_error(hide(output)),
+            **({"selected": selection} if selection is not None else {}),
+        }
+
+    # --- тесты исправлений ---
+
+    def step_retest(self):
+        """Тесты исправлений (#465): после допуска — только строка `tests` по файлам своих
+        коммитов починки и только если дальше `/verify`; без `/verify` починку проверяют CI или
+        ворота. Не годен отчёт ревью (код после пропуска «только документы», ветка переписана)
+        — сначала ревью."""
+        core, st = self.core, self.state
+        if self.reviewed() is None:
+            return self.readmit()
+        current = core.head()
+        base = st["tested"] or (st["checks"] or {}).get("head")
+        files = self.fix_files(base)
+        if not files or not self.verify_ahead():
+            st.go("verify")
+            return None
+        tests = [(n, a) for n, a in core.profile_checks(self.root / PROFILE) if n == "tests"]
+        if not tests:
+            note = "строки `tests` в профиле нет"
+            st["retest"] = {
+                "head": current,
+                "results": [{"name": "tests", "code": 0, "note": note}],
+            }
+            st["tested"] = current
+            st.go("verify")
+            return None
+        name, argv = tests[0]
+        result = self.run_check(name, argv, files)
+        brief = self.brief(result)
+        st["checks_run"] = {"head": current, "results": [brief]}
+        if result["code"] == 0:
+            st["retest"] = {"head": current, "results": [brief]}
+            st["tested"] = current
+            st["attempts"].pop("checks", None)
+            st.go("verify")
+            return None
+        return self.red_checks([result], "Тесты исправлений красные", RERUN_RETEST)
+
+    def readmit(self):
+        """Отчёт ревью не годен (код после пропуска «только документы», ветка переписана) —
+        ревью заново, и до него — допуск заново: новый код не идёт на платное ревью без него."""
+        st = self.state
+        st["checks"] = st["admission"] = st["tested"] = st["retest"] = None
+        st.go("checks")
+        return None
+
+    def verify_ahead(self) -> bool:
+        """Дальше пойдёт `/verify`: он нужен и не снят, а итога нет, итог FAIL или после PASS
+        починка задела код приложения."""
+        decision = self.state["verify"] or {}
+        if not decision.get("needed") or self.state["verify_off"]:
+            return False
+        if decision.get("verdict") not in ("PASS", "пропущено"):
+            return True
+        if self.app_code(self.fix_files(decision.get("head"), deleted=True)):
+            return True
+        return self.criteria_changed()  # /verify пойдёт заново — его тесты перед ним
+
+    def fix_files(self, sha: str | None, deleted: bool = False) -> list[str]:
+        """Файлы своих коммитов ветки после `sha`: первая линия истории без коммитов слияния —
+        правки main, принесённые догоном, сюда не входят (стык проверяет CI). Без `deleted` —
+        только файлы, что есть в дереве (аргументы `{files}`); с ним — и удалённые (удаление
+        кода — тоже правка кода). `sha` нет или не предок `HEAD` (история переписана) — файлы
+        всей ветки."""
+        core = self.core
+        if not sha or not core.git_ok("merge-base", "--is-ancestor", sha, "HEAD"):
+            if deleted:
+                diff = ["diff", "--name-only", "--no-renames", "-z", "origin/main...HEAD"]
+                return [x for x in core.git(*diff).split("\0") if x]
+            return core.branch_files()
+        out = core.git(
+            "-c",
+            "core.quotepath=off",  # не-ASCII пути — как есть, не в кавычках с escape
+            "log",
+            "--first-parent",
+            "--no-merges",
+            "--name-only",
+            "--format=",
+            "--no-renames",
+            f"{sha}..HEAD",
+        )
+        found = list(dict.fromkeys(x for x in out.splitlines() if x.strip()))
+        return found if deleted else [f for f in found if (self.root / f).is_file()]
+
+    def app_code(self, files: list[str]) -> bool:
+        """Среди файлов есть код приложения — не документ (правило `review`, с картой блока
+        ```verify-tool, #417) и не тест (шаблоны `tests` блока ```affected-tests профиля)."""
+        if not files:
+            return False
+        selector = load_script("affected-tests")
+        try:
+            patterns = selector.read_settings(self.root)["tests"]
+        except (selector.SettingsError, OSError):  # испорченный блок — шаблон по умолчанию
+            patterns = list(selector.DEFAULT_TESTS)
+        code = [f for f in files if not selector.matches(f, patterns)]
+        if not code:
+            return False
+        review = load_review()
+        try:
+            base = self.core.git("merge-base", "origin/main", "HEAD").strip()
+            tool = review.tool_paths(base) + review.tool_paths("HEAD")
+        except (review.UsageError, self.core.Failure):
+            return True
+        return not all(review.is_docs(f, tool) for f in code)
 
     @staticmethod
     def brief(result: dict) -> dict:
@@ -1168,26 +1345,6 @@ class Route:
             return not any(m in trace["line"] for m in REWRITTEN)
         return bool(core.git("diff", "--name-only", before, "HEAD"))
 
-    def docs_only_since(self, sha: str | None) -> bool:
-        if not sha:
-            return False
-        if not self.core.git_ok("cat-file", "-e", f"{sha}^{{commit}}"):
-            return False
-        files = self.core.git("diff", "--name-only", "--no-renames", sha, "HEAD").splitlines()
-        review = load_review()
-        if not all(review.is_docs(f) for f in files):
-            return False
-        if not files:
-            return True
-        # Пути блока ```verify-tool — код, как у `review` (#417): основы и ветки (блок, который
-        # завела ветка, — тоже); не прочитаны — не документы.
-        try:
-            base = self.core.git("merge-base", "origin/main", "HEAD").strip()
-            tool = review.tool_paths(base) + review.tool_paths("HEAD")
-        except (review.UsageError, self.core.Failure):
-            return False
-        return all(review.is_docs(f, tool) for f in files)
-
     # --- /verify ---
 
     def verify_criteria(self, decision: dict) -> tuple[str, int, bool]:
@@ -1231,12 +1388,14 @@ class Route:
                 "тикет открыл не участник репозитория, его заголовок и тело не критерий, а "
                 "комментариев участников нет: критерии /verify — комментарием владельца в тикете"
             )
-        # Итог засчитан, пока после него менялись только документы и критерии те же (#181):
-        # новый комментарий владельца после PASS — /verify заново. Пометка об отброшенных — вне
-        # суммы: посторонний комментарием не перезапустит платный /verify.
+        # Итог засчитан, пока починка после него не задела код приложения (#465: документы и
+        # тесты — не код) и критерии те же (#181): новый комментарий владельца после PASS —
+        # /verify заново. Пометка об отброшенных — вне суммы: посторонний комментарием не
+        # перезапустит платный /verify.
         digest = hashlib.sha256(text.encode()).hexdigest()
         passed = decision.get("verdict") in ("PASS", "пропущено")
-        if passed and decision.get("criteria") == digest and self.docs_only_since(decision["head"]):
+        same = passed and decision.get("criteria") == digest
+        if same and not self.app_code(self.fix_files(decision.get("head"), deleted=True)):
             st.go("sync")
             return None
         copy = core.prod_copy(st)
@@ -1307,7 +1466,7 @@ class Route:
                 return self.stop(f"/verify оставляет след в worktree: {left[0]}", trace)
             failed = ""
             if verdict == "FAIL":
-                st.go("checks")  # после уборки и починки — тесты и /verify заново
+                st.go("retest")  # после уборки и починки — тесты исправлений и /verify
                 report_md = (st.dir / "verify.md").read_text(encoding="utf-8").strip()
                 failed = (
                     f"/verify: FAIL — почини и это (коммит):\n{report_md}\n\nКритерий не "
@@ -1323,7 +1482,7 @@ class Route:
         attempt = st.attempt("verify")
         if attempt > LIMIT:
             return self.stop(f"/verify: FAIL {attempt}-й раз")
-        st.go("checks")  # после починки — тесты и /verify заново
+        st.go("retest")  # после починки — тесты исправлений и /verify заново
         report_md = (st.dir / "verify.md").read_text(encoding="utf-8").strip()
         return self.turn(
             "/verify: FAIL",
@@ -1365,10 +1524,7 @@ class Route:
         if fetch.returncode != 0:
             return self.stop(f"git fetch origin: {tail(fetch.stderr, 3)}")
         if core.git_ok("merge-base", "--is-ancestor", "origin/main", "HEAD"):
-            if (st["checks"] or {}).get("head") != core.head():
-                st.go("checks")  # слитое из main — тесты на слитом коде
-                return None
-            st.go("body")
+            st.go("body")  # после догона проверки не повторяются — стык проверяет CI (#465)
             return None
         (self.root / core.ANSWERS / "sync.md").unlink(missing_ok=True)  # объяснение прошлого догона
         base = core.git("rev-parse", "origin/main")
@@ -1378,7 +1534,7 @@ class Route:
         record = {"base": base, "conflict": merge.returncode != 0, "install": install}
         st["sync"] = record
         if merge.returncode == 0:
-            st.go("checks")
+            st.go("body")
             return None
         unresolved = core.git("diff", "--name-only", "--diff-filter=U").splitlines()
         if not unresolved:
@@ -1404,7 +1560,8 @@ class Route:
 
     def step_body(self):
         if self.state["heads"].get("body") != self.core.head():
-            self.state.go("checks")  # коммит на шаге тела — проверки, /verify и догон заново
+            # Коммит на шаге тела — починка: тесты исправлений перед /verify, догон, тело заново.
+            self.state.go("retest")
             return None
         summary = self.core.read_answer(self.root, "summary.md")
         if not summary:
@@ -1438,12 +1595,23 @@ class Route:
         return f"Ревью ошибок: найдено {found} — {', '.join(parts)}; {cost:.2f} USD"
 
     def checks_line(self) -> str:
+        """Допуск и, если были, тесты исправлений — для тела PR и итога."""
+
+        def listed(run: dict) -> str:
+            shown = []
+            for r in run.get("results", []):
+                said = r["note"] if r.get("note") else f"код {r['code']}"
+                if r.get("head") and r["head"] != (run.get("admitted") or run.get("head")):
+                    said += f" на `{r['head'][:7]}`"  # прошла в прошлом круге допуска
+                shown.append(f"`{r['name']}` — {said}")
+            return "; ".join(shown)
+
         checks = self.state["checks"] or {}
-        results = "; ".join(
-            f"`{r['name']}` — " + (r["note"] if r.get("note") else f"код {r['code']}")
-            for r in checks.get("results", [])
-        )
-        return f"Тесты и линтеры на `{checks.get('head', '?')[:7]}`: {results}"
+        admitted = checks.get("admitted") or checks.get("head") or "?"
+        line = f"Допуск до ревью на `{admitted[:7]}`: {listed(checks)}"
+        if retest := self.state["retest"]:
+            line += f"; тесты исправлений на `{retest['head'][:7]}`: {listed(retest)}"
+        return line
 
     def verify_line(self) -> str:
         if off := self.state["verify_off"]:
@@ -1510,14 +1678,18 @@ class Route:
             return self.stop(why)
         body = st.dir / "pr-body.md"
         if self.reviewed() is None:
-            st.go("review")  # отчёт ревью устарел (ветка переписана) — ревью заново
-            return None
+            return self.readmit()  # отчёт ревью устарел (ветка переписана) — допуск и ревью
         if not body.exists() or (st["heads"].get("body") != core.head()):
-            st.go("checks")  # коммит после сборки тела — проверки, догон и тело заново
+            st.go("retest")  # коммит после сборки тела — как починка, тело заново
             return None
         if self.criteria_changed():
             st.go("verify")  # владелец дополнил тикет после PASS — /verify и тело заново
             return None
+        # Проверки маршрута по правилам #465 пройдены на этом head: допуск, тесты исправлений
+        # перед /verify; после догона и тела PR не повторяются. `checks.head` — head, на котором
+        # их засчитал маршрут: по нему оркестратор ставит отметку (`unmarkable`), `admitted` —
+        # head допуска для тела PR.
+        st["checks"] = {**(st["checks"] or {}), "head": core.head()}
         title = core.issue_head(self.n)["title"]  # у тикета постороннего — только номер
         args = ["--title", f"#{self.n}: {title}".rstrip(": ")]
         args += ["--body-file", str(body), "--review-report", str(st.dir / "review.json")]
@@ -1538,12 +1710,13 @@ class Route:
         core.say(res.stdout.rstrip())
         if res.returncode == GATES_RED:
             # Местные ворота воркфлоу без CI (#328): красный тест или линтер чинит сессия, как
-            # красный шаг «тесты и линтеры», а не владелец.
+            # красные проверки маршрута, а не владелец.
             attempt = st.attempt("gates")
             if attempt > LIMIT:
                 return self.stop(f"местные ворота красные {attempt}-й раз: {tail(res.stderr, 5)}")
-            st.go("checks")
-            body = f"{tail(res.stderr, 30)}\n\n{CHECKS_TASK.format(attempt=attempt, limit=LIMIT)}"
+            st.go("retest")  # ворота после починки перегонят всё сами
+            task = CHECKS_TASK.format(attempt=attempt, limit=LIMIT, rerun=RERUN_GATES)
+            body = f"{tail(res.stderr, 30)}\n\n{task}"
             return self.turn("Красные местные ворота", body, long="тесты — до 45 минут")
         if res.returncode != 0:
             return self.stop(f"ship-finish отказал (код {res.returncode}): {tail(res.stderr, 5)}")
@@ -1573,7 +1746,7 @@ class Route:
         if not core.orchestrated():
             # Тикет оркестратора доводит ручная сессия: ревью сама (если его не было) и полный
             # финиш с отметкой — проверки на том же head не повторяются.
-            st.go("checks" if ready.get("reviewed") else "review")
+            st.go("retest" if ready.get("reviewed") else "checks")
             return None
         if not ready.get("reviewed"):
             if self.reviewed() is not None:  # отчёт ревью оркестратора — разбор находок
@@ -1585,9 +1758,9 @@ class Route:
         st["attempts"] = {}  # новые коммиты после «код готов»: красный CI, догон базы
         if self.pr_merged():
             st.retire(self.root)
-            st.go("review")
+            st.go("checks")
             return None
-        st.go("checks")
+        st.go("retest")
         return None
 
     def ready_result(self):
@@ -1596,8 +1769,9 @@ class Route:
         sha = ready["head"][:7]
         if ready["reviewed"]:
             body = (
-                f"PR: {st['pr']} — {st['finish_line']}\nНаходки разобраны, тесты и догон базы "
-                f"пройдены на `{sha}`; {self.verify_line()}. Отметку review и авто-мёрж "
+                f"PR: {st['pr']} — {st['finish_line']}\nНаходки разобраны, проверки маршрута "
+                f"по его правилам и догон базы пройдены на `{sha}`; {self.verify_line()}. "
+                "Отметку review и авто-мёрж "
                 "поставит оркестратор после CI; красный CI или конфликт он вернёт этой сессии "
                 "заданием."
             )
@@ -1708,7 +1882,7 @@ class Route:
             lines.append(f"- {self.review_line()}")
         if run := st["checks_run"]:
             results = "; ".join(f"`{r['name']}` — код {r['code']}" for r in run["results"])
-            lines.append(f"- Тесты и линтеры на `{run['head'][:7]}`: {results}")
+            lines.append(f"- Проверки на `{run['head'][:7]}`: {results}")
         if st["verify"]:
             lines.append(f"- {self.verify_line()}")
         if trace := (st["stop"] or {}).get("trace"):
