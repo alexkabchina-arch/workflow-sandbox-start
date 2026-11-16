@@ -4,22 +4,17 @@ from sandbox.money.change import change_kop
 
 
 def test_change_is_paid_minus_due():
-    assert change_kop(1000, 730) == 270
+    assert change_kop(1000, 700) == 300
 
 
-def test_exact_payment_is_zero_change():
-    assert change_kop(500, 500) == 0
+@pytest.mark.parametrize(("paid", "due"), [(1000, 1000), (700, 1000)])
+def test_exact_or_underpayment_is_zero_change(paid, due):
+    assert change_kop(paid, due) == 0
 
 
-def test_underpayment_is_error():
-    with pytest.raises(ValueError, match=r"^оплачено меньше суммы$"):
-        change_kop(400, 500)
-
-
-def test_underpayment_by_one_kop_is_error():
-    # Граница: на копейку меньше — уже ошибка, а не отрицательная сдача
-    with pytest.raises(ValueError, match=r"^оплачено меньше суммы$"):
-        change_kop(499, 500)
+def test_underpayment_by_one_kop_is_zero_change():
+    # Граница: на копейку меньше — сдачи нет, а не отрицательная сдача
+    assert change_kop(999, 1000) == 0
 
 
 def test_change_exact_on_large_sum():
@@ -27,7 +22,13 @@ def test_change_exact_on_large_sum():
     assert change_kop(10**17 + 1, 10**17) == 1
 
 
-@pytest.mark.parametrize(("paid", "due"), [(-100, -500), (-1000, -730), (100, -1)])
+@pytest.mark.parametrize(("paid", "due", "expected"), [(0, 0, 0), (500, 0, 500), (0, 500, 0)])
+def test_zero_amount_is_allowed(paid, due, expected):
+    # Граница: ноль — не отрицательная сумма, ошибки нет
+    assert change_kop(paid, due) == expected
+
+
+@pytest.mark.parametrize(("paid", "due"), [(-1, 1000), (1000, -1), (-100, -500)])
 def test_negative_amount_is_error(paid, due):
     with pytest.raises(ValueError, match=r"^сумма не может быть отрицательной$"):
         change_kop(paid, due)
