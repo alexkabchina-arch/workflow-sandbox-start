@@ -21,3 +21,16 @@ def test_shortfall_by_one_kop():
 def test_negative_amount_is_error(paid, due):
     with pytest.raises(ValueError, match=r"^сумма не может быть отрицательной$"):
         shortfall_kop(paid, due)
+
+
+@pytest.mark.parametrize(("paid", "due", "expected"), [(0, 1000, 1000), (1000, 0, 0), (0, 0, 0)])
+def test_zero_amount_is_allowed(paid, due, expected):
+    # Граница: ноль — не отрицательная сумма, ошибки нет
+    assert shortfall_kop(paid, due) == expected
+
+
+def test_shortfall_exact_on_large_sum():
+    # Целые копейки без float: недостача в копейку видна и на больших суммах
+    result = shortfall_kop(10**17, 10**17 + 1)
+    assert result == 1
+    assert isinstance(result, int)
