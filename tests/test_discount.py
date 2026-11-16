@@ -23,6 +23,15 @@ def test_discount_below_half_rounds_down():
     assert discount_kop(149, 1) == 1
 
 
+def test_discount_is_int():
+    assert type(discount_kop(999, 15)) is int
+
+
+def test_discount_exact_on_large_sum():
+    # float на 10**17 теряет младшие цифры: 50 % от 10**17 + 1 = 5 * 10**16 + 0,5 → вверх
+    assert discount_kop(10**17 + 1, 50) == 5 * 10**16 + 1
+
+
 def test_discount_bounds_are_valid():
     assert discount_kop(1000, 0) == 0
     assert discount_kop(1000, 100) == 1000
