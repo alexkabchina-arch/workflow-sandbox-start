@@ -32,14 +32,17 @@
    прогон не по `pull_request_target` (джоб ветки с тем же именем) — PR берётся с заданием
    прочитать лог: причина в ветке — починка, иначе отчёт об остановке. В PR есть «Отчёт об
    остановке» — промпт велит прочитать его и ответ владельца.
-3. Тикет: открыт, не назначен другому. Сессия тикета уже идёт (замок `session-run` в его
-   worktree) — стоп. Ручной старт (не под оркестратором) тикета с меткой `agent:queued` или
-   тикета, который ведёт оркестратор (по его состоянию `canon-orchestrator/state.json`: процесс
-   последнего запуска жив — номер и время старта те же — или тикет на шаге, кроме остановки), —
-   стоп (#221). Тикет открыл не участник
+3. Тикет: открыт, не назначен другому. Тикет ведёт другая живая сессия (отметка ниже) — стоп,
+   а если она ждёт ответа на вопрос `ticket ask` — с подсказкой продолжить её. Сессия тикета уже
+   идёт (замок `session-run` в его worktree) — стоп. Ручной старт (не под оркестратором) тикета
+   с меткой `agent:queued` или тикета, который ведёт оркестратор (по его состоянию
+   `canon-orchestrator/state.json`: процесс последнего запуска жив — номер и время старта те же —
+   или тикет на шаге, кроме остановки), — стоп (#221). Тикет открыл не участник
    репозитория или в нём комментарий не участника, и скрытый, — стоп (#196, #159): `/implement`
    читает тикет целиком.
-4. Worktree и ветка: уже есть worktree на ветке — он; иначе внутри главного
+4. Worktree и ветка: уже есть worktree на ветке — он, кроме главной папки: главная папка на
+   ветке тикета, без рабочей копии, — стоп с командой переключить её на main и путём рабочей
+   копии (#458, слабое место 6); иначе внутри главного
    `.claude/worktrees/ticket-N` (`.claude/worktrees/pr-M`) на ветке `ticket-N` от `origin/main` (на
    ветке PR): в такой worktree открытая сессия входит `EnterWorktree` с `path` без клика владельца
    — из главного чекаута и из другого worktree.
@@ -68,6 +71,24 @@
 5. Метка `in-progress` и исполнитель — я: после worktree и `setup`, чтобы сбой на них не оставил
    тикет занятым без сессии.
 
+Отметка «тикет ведёт сессия» (#458) — `owner.json` в каталоге состояния тикета: какая сессия
+агента ведёт тикет. Пишется стартом тикета после worktree, для ручных сессий и для `session-run`;
+человек в терминале без агента отметку не пишет. Сессия — по окружению агента: Claude Desktop —
+`CLAUDE_CODE_HOST_SESSION_ID`, Claude Code в терминале — `CLAUDE_CODE_SESSION_ID`, Codex —
+процесс `codex…` среди предков, `session-run` — его процесс. Своя сессия (та же метка, в том
+числе после перезапуска её процесса) — не стоп, отметка обновляется. Жива: процесс сессии тот же
+(`CLAUDE_PID` или процесс Codex; номер и время старта) — так живёт и ждущая ответа сессия в
+терминале; у Desktop ещё — сессия в списке приложения и не в архиве: приложение гасит процесс
+простаивающей сессии, а ждущая ответа сессия — живая. Закрыта (процесса нет; Desktop — в архиве
+или удалена) — старт продолжает работу тикета и пишет свою отметку. Отметка снимается, когда PR
+тикета слит (уборка `unmark_merged`). Под оркестратором отметки нет: сессии ведёт он.
+Принятое ограничение: субагенты Codex — потоки одного процесса координатора, у них общий
+процесс и общее окружение, и отметка их не различает: второй старт субагентом Codex того же
+процесса — своя сессия, не стоп. Так же вложенный `claude -p` из команды сессии Desktop
+(наследует `CLAUDE_CODE_HOST_SESSION_ID`). Отметка пишется до `setup` под блокировкой реестра и
+снимается, если старт упал после неё; не держит, если PR маршрута слит; PR автора с живой чужой
+отметкой его тикета не берётся. Claude Code без `CLAUDE_PID` отметку не пишет.
+
 Итог — путь worktree, метка сессии `CANON_SESSION` (её читает Stop-хук), промпт (тикет —
 `/start N`, #452) и строка «Запуск:» для новой сессии из терминала. Не из `session-run` и не
 изнутри worktree плана — ещё строка «Открытая сессия: перейти в рабочую копию по пути … (Claude
@@ -78,7 +99,8 @@ Code — `EnterWorktree` с `path` …)» и стопом, если перехо
 плана); из другого worktree вход в `.claude/worktrees/` клика не ждёт (прогон #142). С `--json` —
 последней строкой JSON. Код
 выхода 0 — готово; 1 — сбой git, `gh` или `scripts/session/setup`; 2 — ошибка аргументов, тикет
-закрыт, занят другим или оркестратором, в нём текст посторонних, сессия тикета уже идёт,
+закрыт, занят другим или оркестратором, в нём текст посторонних, сессия тикета уже идёт или
+его ведёт другая живая сессия, главная папка на ветке тикета,
 неоднозначная или уже слитая ветка тикета (сообщение говорит, что убрать).
 
 Под оркестратором (`CANON_ORCHESTRATOR=1`, #214) очередь ведёт он: PR автора не берутся (шаг 2
@@ -154,6 +176,12 @@ RED = {"FAILURE", "ERROR", "TIMED_OUT", "CANCELLED", "ACTION_REQUIRED", "STARTUP
 # Замок сессии в личном каталоге git worktree: `session-run` держит его, пока идёт `claude`.
 SESSION_LOCK = core.SESSION_LOCK
 SESSION_BRANCH = re.compile(r"^ticket-\d+(-.+)?$")
+# Отметка «тикет ведёт сессия» (#458) — в каталоге состояния тикета (`ticket_core.STATE_DIR`).
+OWNER = "owner.json"
+# Список сессий Claude Desktop: `<учётная запись>/<организация>/<id сессии>.json` с `isArchived`.
+DESKTOP_SESSIONS = "Library/Application Support/Claude/claude-code-sessions"
+DESKTOP_ID = re.compile(r"^[\w-]+$")
+ANCESTORS = 20  # глубина поиска процесса Codex среди предков
 PR_FIELDS = (
     "number,title,url,headRefName,headRefOid,baseRefName,isDraft,statusCheckRollup,"
     "autoMergeRequest,mergeable,mergeStateStatus"
@@ -343,6 +371,173 @@ def orchestrator_ticket(number: int) -> str | None:
     if phase and phase != "stopped":
         return f"его ведёт оркестратор (шаг `{phase}`)"
     return None
+
+
+# --- отметка «тикет ведёт сессия» (#458) ---
+
+
+def owner_path(number: int) -> Path:
+    return common_dir() / core.STATE_DIR / str(number) / OWNER
+
+
+def codex_pid() -> int | None:
+    """Процесс Codex среди предков старта — самый дальний с именем `codex…`: ближние (помощник
+    песочницы `codex-linux-sandbox`) живут одну команду. Нет — None. Один `ps` на все процессы."""
+    res = subprocess.run(["ps", "-axo", "pid=,ppid=,comm="], capture_output=True, text=True)
+    table = {}
+    for line in res.stdout.splitlines():
+        parts = line.split(None, 2)
+        if len(parts) == 3 and parts[0].isdigit() and parts[1].isdigit():
+            table[int(parts[0])] = (int(parts[1]), Path(parts[2].strip()).name.lower())
+    found, pid = None, os.getppid()
+    for _ in range(ANCESTORS):
+        if pid <= 1 or pid not in table:
+            break
+        parent, name = table[pid]
+        if name.startswith("codex"):
+            found = pid
+        pid = parent
+    return found
+
+
+def own_mark(claim) -> dict | None:
+    """Отметка сессии этого старта; None — сессии агента, жизнь которой можно проверить, нет
+    (человек в терминале): отметка не пишется, чужая живая всё равно останавливает. Сессия —
+    Claude Desktop (`CLAUDE_CODE_HOST_SESSION_ID`: одна на все процессы сессии), сессия Claude
+    Code (`CLAUDE_CODE_SESSION_ID` с процессом `CLAUDE_PID`), процесс Codex или `session-run`
+    (`claim`: сессия — его процесс, пока идёт `claude`)."""
+    if claim is not None:
+        pid = os.getpid()
+        return {"session": f"session-run:{pid}", "pid": pid, "pid_started": started_at(pid)}
+    desktop = os.environ.get("CLAUDE_CODE_HOST_SESSION_ID", "")
+    cli = os.environ.get("CLAUDE_CODE_SESSION_ID", "")
+    raw = os.environ.get("CLAUDE_PID", "")
+    pid = int(raw) if raw.isdigit() else None
+    if desktop and DESKTOP_ID.match(desktop):
+        session = f"desktop:{desktop}"
+    elif pid is not None:  # Claude Code в терминале; без id сессии — сам процесс
+        session = f"claude:{cli}" if cli else f"claude-pid:{pid}:{started_at(pid)}"
+    elif cli:
+        return None  # процесса нет — жизнь отметки не проверить
+    elif (pid := codex_pid()) is not None:
+        session = f"codex:{pid}:{started_at(pid)}"
+    else:
+        return None
+    mark = {"session": session, "pid": pid, "pid_started": started_at(pid) if pid else ""}
+    if session.startswith("desktop:"):
+        mark["desktop"] = desktop
+    return mark
+
+
+def desktop_open(session: str) -> bool:
+    """Сессия Claude Desktop не закрыта: её файл в списке сессий приложения есть и не в архиве.
+    Ждущая ответа сессия Desktop живёт без процесса — приложение гасит процесс простаивающей
+    сессии и поднимает его на следующем сообщении. Списка сессий нет или файл не читается (другая
+    раскладка приложения) — живая: неизвестное не пускает второй старт; снять отметку владелец
+    может, закрыв сессию или удалив файл отметки (путь — в причине стопа)."""
+    if not DESKTOP_ID.match(session):
+        return False
+    root = Path.home() / DESKTOP_SESSIONS
+    if not root.is_dir():
+        return True
+    for path in root.glob(f"*/*/{session}.json"):
+        try:
+            return not json.loads(path.read_text(encoding="utf-8")).get("isArchived")
+        except (OSError, ValueError, AttributeError):
+            return True
+    return False
+
+
+def owner_alive(mark: dict) -> bool:
+    """Жива: процесс сессии тот же (номер и время старта) или сессия Desktop не закрыта."""
+    if mark.get("pid_started") and run_alive(mark):
+        return True
+    return bool(mark.get("desktop")) and desktop_open(mark["desktop"])
+
+
+def read_owner(number: int) -> dict | None:
+    try:
+        mark = json.loads(owner_path(number).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return mark if isinstance(mark, dict) and mark.get("session") else None
+
+
+def ticket_state(number: int) -> dict:
+    """Состояние маршрута тикета (`core.State`); нет или не читается — пустое."""
+    try:
+        return core.State(number).data
+    except (core.Failure, OSError, ValueError):
+        return {}
+
+
+def route_merged(state: dict) -> bool:
+    """PR маршрута слит: сессия тикета кончилась, даже если `ticket wait` прервали до уборки и
+    отметку никто не снял. Сбой `gh` — не слит (отметка держит)."""
+    url = state.get("pr")
+    if not url:
+        return False
+    if state.get("merged") or state.get("merged_at"):
+        return True
+    try:
+        data = json.loads(run("gh", "pr", "view", url, "--json", "state") or "{}")
+    except (StartError, ValueError):
+        return False
+    return isinstance(data, dict) and data.get("state") == "MERGED"
+
+
+def foreign_owner(number: int, me: dict | None) -> dict | None:
+    """Живая чужая отметка тикета; None — нет, своя (та же метка), закрыта или маршрут слит."""
+    mark = read_owner(number)
+    if mark is None or (me is not None and mark["session"] == me["session"]):
+        return None
+    if not owner_alive(mark) or route_merged(ticket_state(number)):
+        return None
+    return mark
+
+
+def owner_who(mark: dict) -> str:
+    if mark.get("desktop"):
+        return f"сессия Claude Desktop {mark['desktop']}"
+    return f"сессия {mark['session']} (процесс {mark.get('pid')})"
+
+
+def check_owner(number: int, me: dict | None) -> None:
+    """Тикет ведёт другая живая сессия — стоп; ждёт ответа — подсказка продолжить её. Своя
+    сессия (та же метка) и закрытая — не стоп. Проверка — до ветки «вопрос ждёт ответа» `ticket
+    start`: иначе ответ из тикета заберут две сессии."""
+    if (mark := foreign_owner(number, me)) is None:
+        return
+    text = (
+        f"тикет #{number} уже ведёт другая сессия — {owner_who(mark)}: второй старт остановлен, "
+        "иначе две сессии пишут в одну рабочую копию"
+    )
+    if question := (ticket_state(number).get("question") or {}).get("url"):
+        text += (
+            f". Она ждёт ответа на вопрос {question} — продолжить её: ответ в тикете, затем "
+            "«продолжай» в ту сессию"
+        )
+    text += (
+        ". Когда та сессия закрыта (процесс завершён; Claude Desktop — сессия в архиве), старт "
+        f"продолжит работу тикета; отметка — {owner_path(number)}"
+    )
+    raise UsageError(text)
+
+
+def write_owner(number: int, me: dict) -> None:
+    path = owner_path(number)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    text = json.dumps({**me, "since": core.now()}, ensure_ascii=False) + "\n"
+    with tempfile.NamedTemporaryFile("w", dir=path.parent, delete=False, encoding="utf-8") as tmp:
+        tmp.write(text)
+    os.replace(tmp.name, path)
+
+
+def release_owner(number: int) -> None:
+    """PR тикета слит — сессия кончилась: отметка снимается, иначе незакрытая сессия Desktop
+    держала бы переоткрытый тикет. Так же — сбой старта после записи отметки: тикет не начат."""
+    with contextlib.suppress(OSError, StartError):
+        owner_path(number).unlink(missing_ok=True)
 
 
 @contextlib.contextmanager
@@ -564,6 +759,7 @@ def unmark_merged(branch: str) -> None:
         if any(re.match(rf"^ticket-{number}(-.+)?$", name) for name in names):
             note(f"тикет #{number}: метка {IN_PROGRESS} оставлена — у тикета есть другая ветка")
             return
+        release_owner(int(number))
         if v2_session():  # токен сессии v2 — только чтение: метку снимает оркестратор (#341)
             return
         issue = json.loads(run("gh", "issue", "view", number, "--json", "labels"))
@@ -837,10 +1033,16 @@ def stop_report(pr: dict) -> str:
     return text + "\n\n"
 
 
-def pick_pr() -> dict | None:
+def pick_pr(me: dict | None = None) -> dict | None:
+    """PR автора, требующий внимания; PR с живой сессией — замок `session-run` или отметка «тикет
+    ведёт сессия» его тикета (#458; не своя) — пропуск."""
     for pr, red in attention():
         if busy := session_busy(pr["headRefName"]):
             note(f"PR #{pr['number']}: в {busy} уже идёт сессия — пропущен")
+            continue
+        number = core.ticket_of(pr["headRefName"])
+        if number is not None and (mark := foreign_owner(number, me)) is not None:
+            note(f"PR #{pr['number']}: тикет #{number} ведёт {owner_who(mark)} — пропущен")
             continue
         sha, branch = pr["headRefOid"][:7], pr["headRefName"]
         answered = stop_report(pr)
@@ -1049,10 +1251,17 @@ def ignore_session_worktrees(main: Path) -> None:
 
 def ensure_worktree(main: Path, branch: str, name: str, pending: set[str]) -> Path:
     """Worktree на ветке: существующий, иначе новый `.claude/worktrees/<name>` главного."""
+    path = (main / SESSION_WORKTREES / name).resolve()
     if existing := worktree_of(branch):
+        if existing.resolve() == main.resolve():
+            # Слабое место 6 (#458): работа тикета в главной папке, где идут все сессии проекта.
+            raise UsageError(
+                f"главная папка {main} на ветке сессии {branch}, рабочей копии нет: переключите "
+                f"её на main (`git -C {main} switch main`; незакоммиченное — сначала коммит в "
+                f"ветку) и повторите старт — рабочая копия ветки {branch} будет {path}"
+            )
         return existing
     ignore_session_worktrees(main)
-    path = (main / SESSION_WORKTREES / name).resolve()
     # Ресурсы проекта привязаны к имени сессии, а не к пути: прежний `../<проект>-<name>` (до
     # режима В) с неубранными ресурсами держит и новый путь.
     if any(Path(p).name in (name, f"{main.name}-{name}") for p in pending):
@@ -1112,9 +1321,14 @@ def start(number: int, claim=None, here: Path | None = None) -> dict:
         # --prune: ветка, удалённая на сервере после мёржа, не должна браться из старой ссылки.
         run("git", "fetch", "-q", "--prune", "origin")
         sync_main(main)
-        plan = None if core.orchestrated() else pick_pr()  # очередь ведёт оркестратор
+        # Отметка (#458) — под оркестратором её нет: сессии и очередь ведёт он сам.
+        me = None if core.orchestrated() else own_mark(claim)
+        plan = None if core.orchestrated() else pick_pr(me)  # очередь ведёт оркестратор
+        written = False
         if plan is None:
             unmarked = check_ticket(number)
+            if not core.orchestrated():
+                check_owner(number, me)
             branch = ticket_branch(number)
             if busy := session_busy(branch):
                 raise UsageError(f"сессия тикета #{number} уже идёт в {busy}")
@@ -1128,6 +1342,9 @@ def start(number: int, claim=None, here: Path | None = None) -> dict:
                 "prompt": f"/start {number}",
             }
             worktree = ensure_worktree(main, branch, plan["session"], pending)
+            if me is not None:
+                write_owner(number, me)
+                written = True
         else:
             plan["postponed"] = number
             pending |= sweep_merged(main, keep=plan["branch"], here=here)
@@ -1140,13 +1357,23 @@ def start(number: int, claim=None, here: Path | None = None) -> dict:
         # #142, п. 1; #159).
         nested = worktree.resolve().is_relative_to((main / SESSION_WORKTREES).resolve())
         plan["needs_click"] = not nested
-        if claim is not None:
-            claim(worktree)
-        entries = read_registry()
-        entries[str(worktree)] = {"session": plan["session"], "branch": plan["branch"]}
-        write_registry(entries)
-    setup(worktree)
-    plan["hook"] = commit_hook(worktree)
+        try:
+            if claim is not None:
+                claim(worktree)
+            entries = read_registry()
+            entries[str(worktree)] = {"session": plan["session"], "branch": plan["branch"]}
+            write_registry(entries)
+        except BaseException:
+            if written:  # тикет не начат — отметка не держит его (прежняя была не жива)
+                release_owner(number)
+            raise
+    try:
+        setup(worktree)
+        plan["hook"] = commit_hook(worktree)
+    except BaseException:
+        if written:
+            release_owner(number)
+        raise
     if plan["kind"] == "ticket" and unmarked:
         mark_ticket(number)
     return plan
