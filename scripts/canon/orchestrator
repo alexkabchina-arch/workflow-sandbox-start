@@ -3370,8 +3370,9 @@ class Orchestrator:
             return  # PRD ведётся: `agent:go` держится до сводки
         led = str(n) in self.data["tickets"]
         prd = not led and bool(self.children(n))
-        if not led and not prd and READY_FOR_AGENT in names and start.IN_PROGRESS in names:
+        if not led and not prd and start.IN_PROGRESS in names:
             # До проверки автора: ручная сессия идёт часами, метка держится — без запроса в такт.
+            # Без `ready-for-agent`: её снимает вопрос ручной сессии (`ticket ask`, #500).
             return say(
                 f"#{n}: {start.IN_PROGRESS} без сессии оркестратора — ручная сессия, пропуск"
             )
@@ -4772,13 +4773,15 @@ class Orchestrator:
         waiting, unready = {}, {}
         for issue in pending:
             n, names = issue["number"], label_names(issue)
-            if READY_FOR_AGENT not in names:
+            # Ручная сессия — до метки триажа: её вопрос снимает `ready-for-agent` (#500).
+            manual = start.IN_PROGRESS in names
+            if READY_FOR_AGENT not in names and not manual:
                 continue
             if HUMAN in names and self.v2():  # путь v2 (#347): ручную сессию не берёт
                 waiting[n] = f"тикет для ручной сессии (`{HUMAN}`) — оркестратор его не берёт"
                 continue
             held = [b for b in blockers(issue.get("body"), self.repo) if b in issues.keys() - gone]
-            if held or start.IN_PROGRESS in names:
+            if held or manual:
                 waiting[n] = (
                     f"заблокирован {', '.join(f'#{b}' for b in held)}"
                     if held
@@ -5272,11 +5275,11 @@ class Orchestrator:
 
     def merged(self, n: int, t: dict, st, pr: dict) -> None:
         gone, problems = self.retire(n, pr.get("headRefOid"))
-        if t.get("v2"):  # уборка в песочнице — токеном на чтение: метку снимает оркестратор
-            try:
-                self.labels(n, remove=(start.IN_PROGRESS,))
+        if t.get("v2"):  # уборка в песочнице — токеном на чтение: метки снимает оркестратор
+            try:  # с `in-progress` — и метка триажа (#500), как в `unmark_merged`
+                self.labels(n, remove=(start.IN_PROGRESS, READY_FOR_AGENT))
             except core.Failure as exc:
-                problems.append(f"метка `{start.IN_PROGRESS}` не снята: {exc}")
+                problems.append(f"метки `{start.IN_PROGRESS}`, `{READY_FOR_AGENT}` не сняты: {exc}")
         cost = self.costs(t, st)
         lines = [
             f"Оркестратор: тикет слит — PR {st['pr']}.",

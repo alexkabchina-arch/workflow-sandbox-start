@@ -166,6 +166,8 @@ REPORT_MARK = "Отчёт об остановке"
 # Ответ владельца из чата, переданный сессией в тикет (`ticket ask`): помечен, чтобы не
 # прочитаться вторым ответом. Решение о `/verify` из чата не передаётся (#249).
 REPLY_MARK = "<!-- canon-ticket-reply -->"
+# Форма ответа владельца из правил координатора (#498): «Ответ владельца: «…»».
+OWNER_REPLY = re.compile(r"Ответ владельца: «.*»", re.S)
 # Режим маршрута «под оркестратором» (#214): флаг окружения от оркестратора. Сессия кончается на
 # «код готов» или на вопросе; ревью ошибок, отметку, авто-мёрж, ожидание и уборку делает он.
 ORCHESTRATED = "CANON_ORCHESTRATOR"
@@ -392,10 +394,35 @@ def keep(st, path: Path, name: str) -> None:
         path.replace(st.dir / name)
 
 
+# Метка триажа «можно брать» (`docs/agents/triage-labels.md`): тикет, который ждёт человека
+# (`ready-for-human` — вопрос или отчёт об остановке), её не держит (#500).
+READY_FOR_AGENT = "ready-for-agent"
+
+
+def untriage(number: int) -> str:
+    """Снять с тикета `READY_FOR_AGENT`, если она есть. Сбой `gh` не держит вопрос или отчёт:
+    итог — примечание для задания (пусто — всё снято или снимать нечего)."""
+    try:
+        issue = gh_json("issue", "view", str(number), "--json", "labels") or {}
+        if any(lb.get("name") == READY_FOR_AGENT for lb in issue.get("labels") or []):
+            gh("issue", "edit", str(number), "--remove-label", READY_FOR_AGENT)
+    except Failure as exc:
+        return f"\n(Метку {READY_FOR_AGENT} снять не удалось: {exc} — сними руками.)"
+    return ""
+
+
 def relay_reply(number: int, reply: str) -> str:
     """Ответ владельца из чата (`.ticket/reply.md`) — комментарием в тикет; ссылка на него (`gh`
-    её печатает) или «тикет #N»."""
-    body = f"{REPLY_MARK}\n**Ответ владельца из чата** (передан сессией)\n\n{mask(reply)}"
+    её печатает) или «тикет #N». Форма — «Ответ владельца: «…»», как правила координатора
+    называют ответ владельца (#498): второй комментарий не нужен. Ответ уже в этой форме не
+    оборачивается второй раз. Ответ в несколько строк или со ссылкой — кавычки отдельными
+    абзацами: Markdown ответа не ломается, и «»» не прилипнет к ссылке. Строка после ответа
+    говорит, что его передала сессия: под учёткой владельца это не его собственный комментарий."""
+    text = mask(reply.strip())
+    if not OWNER_REPLY.fullmatch(text):
+        inline = "\n" not in text and "://" not in text
+        text = f"Ответ владельца: «{text}»" if inline else f"Ответ владельца: «\n\n{text}\n\n»"
+    body = f"{REPLY_MARK}\n{text}\n\n_Передан сессией тикета из чата._"
     posted = gh("issue", "comment", str(number), "--body", body)
     return posted.splitlines()[0] if posted else f"тикет #{number}"
 
