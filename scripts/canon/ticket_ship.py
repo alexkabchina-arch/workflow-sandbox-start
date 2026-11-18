@@ -9,6 +9,7 @@
 
 | Шаг | Скрипт | Агент (файл в `.ticket/`) |
 |---|---|---|
+| документы | `affected-tests --docs`, файлы ветки | обновить или «не задет» (`docs.md`) |
 | допуск | `fast-checks` и `checks` (`run-log`), `{files}` — файлы ветки | починка (`checks.md`) |
 | ревью ошибок | `review`, отчёт рядом с состоянием; «только документы» — без разбора | — |
 | разбор | находки и правило разбора | решения, исправления (`findings.md`) |
@@ -18,18 +19,24 @@
 | догон базы | `git merge origin/main` | конфликт — разрешить (`sync.md`) |
 | тело PR | факты: Closes, тесты, ревью, `/verify`, догон | «Что сделано» (`summary.md`) |
 | финиш | `ship-finish`: push, PR, авто-мёрж, отметка ревью | привязка PR, Auto-fix, `ticket wait` |
-| остановка | отчёт из данных, `ready-for-human` | вопрос и варианты (`stop.md`) |
+| остановка | отчёт, `ready-for-human` без `ready-for-agent` | вопрос и варианты (`stop.md`) |
 
+Задетые документы (#512) — первым делом допуска, один раз на маршрут: документы из блока
+```affected-docs профиля, которые называют изменённые файлы ветки; по каждому сессия отвечает
+«обновлено» (документ изменён в ветке) или «не задет: почему», итог — в теле PR. Блока нет —
+шага нет.
 Проверки — по решению владельца 30.10 (#465, `docs/decisions/2026-10-30-checks-on-start-path.md`):
 допуск — один раз до платного ревью: строки ```fast-checks профиля (список хука; одноимённая
 строка ```checks заменяет строку хука) и строки ```checks (задетые тесты, миграции, документация
-API); упало — после починки перегоняются только упавшие. Починка после допуска (находки, FAIL
-`/verify`, красный CI, красные ворота, поздний коммит) — шаг «тесты исправлений»: строка `tests`
-по файлам своих коммитов починки (без коммитов слияния), и только если дальше `/verify`; без
-`/verify` их проверяют CI или ворота. `/verify` после PASS повторяется, только если починка
-задела код приложения — не документы и не тесты (шаблоны `tests` блока ```affected-tests). После
-догона базы и тела PR проверки не повторяются — стык проверяет CI. Полного набора тестов в
-маршруте нет.
+API); упало — после починки перегоняются только упавшие, а у красной `tests` с общим отбором
+`affected-tests {files}` — только файлы, не названные зелёными, и тесты, задетые починкой (#510;
+так же в тестах исправлений; зелёные не узнаны или своя команда проекта — весь отбор). Починка
+после допуска (находки, FAIL `/verify`, красный CI, красные ворота, поздний коммит) — шаг «тесты
+исправлений»: строка `tests` по файлам своих коммитов починки (без коммитов слияния), и только
+если дальше `/verify`; без `/verify` их проверяют CI или ворота. `/verify` после PASS
+повторяется, только если починка задела код приложения — не документы и не тесты (шаблоны `tests`
+блока ```affected-tests). После догона базы и тела PR проверки не повторяются — стык проверяет CI.
+Полного набора тестов в маршруте нет.
 
 Пределы — два круга исправлений каждого вида (красные проверки, FAIL `/verify`, догон), третий —
 остановка. Новые коммиты после финиша (красный CI, конфликт) — тот же вызов: тесты исправлений
@@ -200,6 +207,11 @@ RULE = """Правило разбора — по каждой находке о�
   правится, тикет в трекер канона заведёт скрипт.
 - не записано — всё прочее: стиль, упрощения, дубли, «если когда-нибудь», непрослеженный
   сценарий. Никуда не пишется, в тело PR — только число.
+Документ механизма или учебник (`docs/` — кроме `docs/agents/`, решений и ADR; README, глоссарий),
+устаревший из-за правки ветки, — исправлено в этой ветке, даже если файл параллельно правит другой
+тикет: конфликт сведёт догон базы. Это не правка сверх тикета, вопрос владельцу не нужен. Решение
+или ADR не переписываются — новый файл со ссылкой на старый, по вопросу владельцу. Техдолг по
+документу — только расхождение, которое было до ветки.
 Инструкция агенту (AGENTS.md, CLAUDE.md, скиллы, профиль, подсказки скриптов) — код: устаревшая,
 по которой агент выполнит неверную команду, — дефект. Правку сверх тикета молча не делать: вопрос
 владельцу или отступление в «Что сделано»."""
@@ -262,8 +274,30 @@ SECRETS_STOP = """Секрет в ветке — не чинить и не гл�
 коммиты ветки переписать без ключа) или ложная тревога (правило в `.gitleaks.toml` основной ветки
 правит владелец) — с рекомендацией (`docs/secrets.md` воркфлоу)."""
 
-RERUN_ADMISSION = "Следующий вызов перегонит только упавшие проверки допуска."
-RERUN_RETEST = "Следующий вызов перегонит тесты, задетые починкой, перед /verify."
+# Задетые документы до ревью (#512): отбор `affected-tests --docs`, правило «документ, устаревший
+# из-за ветки, — в ветке» (#511, решение `2026-11-18-stale-docs-fixed-in-branch.md`).
+DOCS_TASK = """Документы, которые называют изменённые файлы ветки ({count}; блок ```affected-docs
+профиля, #512):
+{listed}
+По каждому одно решение — сверить, что документ говорит об изменённом файле, с кодом ветки:
+- описание расходится с веткой — обнови документ в этой ветке (даже если файл параллельно правит
+  другой тикет: конфликт сведёт догон базы), коммит сообщением одной строкой `-m`; ответ
+  `<путь> — обновлено`;
+- не расходится — `<путь> — не задет: почему` одной строкой: что документ говорит о файле и почему
+  это осталось верным. Уйдёт в тело PR.
+Ответ — в файл `.ticket/docs.md` (Write), строка на каждый документ из списка."""
+DOCS_ANSWER = re.compile(
+    rf"^[-*\s]*`?([^`\s:—–]+?)`?{DASH}(обновлено|не задет)\b[\s:—–-]*(.*)$", re.I
+)
+
+RERUN_ADMISSION = (
+    "Следующий вызов перегонит только упавшие проверки допуска; у `tests` с общим отбором и "
+    "выводом `tests/run.py` — только не зелёные файлы и задетые починкой, иначе весь отбор."
+)
+RERUN_RETEST = (
+    "Следующий вызов перегонит тесты перед /verify: при общем отборе и выводе `tests/run.py` — "
+    "не зелёные файлы и задетые починкой, иначе — задетые всеми коммитами починки."
+)
 RERUN_GATES = (
     "Следующий вызов — тесты, задетые починкой, только если дальше /verify; ворота на финише "
     "перегонят всё сами."
@@ -335,6 +369,59 @@ def selected(path: Path) -> dict | None:
     if not all(isinstance(x, list) and all(isinstance(i, str) for i in x) for x in (files, tests)):
         return None
     return {"files": files, "tests": tests}
+
+
+# Зелёный файл в выводе `tests/run.py`: `ok   test_x.py — тестов: 3, 0.4 с` (имя — от каталога
+# тестов). Перегон после починки (#510) пропускает только файлы, названные так: упавший, не
+# узнанный или не дошедший до конца (прерванный прогон, `limit`) файл идёт снова.
+PASSED_LINE = re.compile(r"^ok\s+(\S+)", re.M)
+# Перегон после починки (#510): команда `run` блока ```affected-tests с заданным списком —
+# через сам `affected-tests` (его настройки, предел `limit` и остановка группы процессов), тем же
+# интерпретатором строки `tests`. Отдельным процессом, а не `load_script`: прогон идёт через
+# `run-log` (лог, остановка), как любая проверка; `-I` — модули проекта в корне (`types.py`) не
+# подменяют стандартные. Защиты — как у `main()` скрипта: ошибка настроек и пустой `run` — код 2.
+RERUN_CODE = (
+    "import pathlib, sys, types\n"
+    "path = pathlib.Path(sys.argv[1])\n"
+    "mod = types.ModuleType('canon_affected_tests_rerun')\n"
+    "mod.__file__ = str(path)\n"
+    "exec(compile(path.read_text(encoding='utf-8'), str(path), 'exec'), mod.__dict__)\n"
+    "try:\n"
+    "    conf = mod.read_settings(pathlib.Path.cwd())\n"
+    "except mod.SettingsError as exc:\n"
+    "    sys.exit(f'affected-tests: {mod.PROFILE}: {exc}')\n"
+    "if not conf['run']:\n"
+    "    sys.exit('affected-tests: в блоке ```affected-tests нет `run` — нечем гонять')\n"
+    "sys.exit(mod.run_tests(conf['run'], sys.argv[2:], conf['limit']))\n"
+)
+
+
+def passed_tests(output: str, tests: list[str]) -> list[str]:
+    """Файлы отбора `tests`, которые вывод прогона называет зелёными (#510) — строкой `ok <файл>`
+    `tests/run.py`, имя совпадает с концом пути ровно у одного файла отбора. Прочие форматы не
+    узнаются — пустой список: перегон тогда весь отбор. Ошибка узнавания лишь расширяет перегон:
+    файл, не названный зелёным, идёт снова."""
+    found = set()
+    for name in PASSED_LINE.findall(output):
+        same = [t for t in tests if t == name or t.endswith(f"/{name}")]
+        if len(same) == 1:
+            found.add(same[0])
+    return [t for t in tests if t in found]
+
+
+def canon_selector(argv: list[str], files_arg: re.Pattern) -> list[str] | None:
+    """Строка `tests` — общий отбор канона `<python> … affected-tests {files}` (#510): команда до
+    `{files}` (обёртка с интерпретатором — `python3`, `uv run python` — и путь скрипта); иначе
+    (своя команда проекта, скрипт без интерпретатора, `{files:шаблоны}`, лишние аргументы) —
+    None."""
+    for i, arg in enumerate(argv):
+        if Path(arg).name == "affected-tests":
+            rest = argv[i + 1 :]
+            python = i > 0 and Path(argv[i - 1]).name.startswith("python")
+            if python and len(rest) == 1 and (m := files_arg.match(rest[0])) and m[1] is None:
+                return argv[: i + 1]
+            return None
+    return None
 
 
 def load_script(name: str) -> types.ModuleType:
@@ -431,6 +518,42 @@ def blocked_reason(report: str) -> str:
         found = next((x for x in texts if not BLOCKED_REASON.search(x)), "")
     found = ASSIGNMENT.sub(r"\1***", URL_PASSWORD.sub(r"\1***\2", found))
     return found[:STOP_WIDTH]
+
+
+def parse_docs_answers(
+    text: str, listed: list[str], changed: set[str]
+) -> tuple[dict[str, list[str]], list[str]]:
+    """Ответ сессии о задетых документах (#512): строка на документ `путь — обновлено` или
+    `путь — не задет: почему`. Ошибки: документ без ответа, путь не из списка, «не задет» без
+    причины, «обновлено» без правки документа в ветке (`changed` — файлы ветки)."""
+    answers: dict[str, list[str]] = {}
+    errors, seen = [], set()
+    for line in text.splitlines():
+        if not line.strip():
+            continue
+        m = DOCS_ANSWER.match(line.strip())
+        if not m:
+            errors.append(
+                f"строка «{line.strip()}» — нужна `путь — обновлено` или `путь — не задет: почему`"
+            )
+            continue
+        doc, kind, said = m[1], m[2].lower(), m[3].strip()
+        seen.add(doc)
+        if doc not in listed:
+            errors.append(f"`{doc}` — не из списка задетых документов")
+        elif kind == "не задет" and not said:
+            errors.append(f"`{doc}` — «не задет» без причины")
+        elif kind == "обновлено" and doc not in changed:
+            errors.append(
+                f"`{doc}` — «обновлено», а в ветке документ не изменён: закоммить правку или "
+                "«не задет: почему»"
+            )
+        else:
+            answers[doc] = [kind, said]
+    missing = [doc for doc in listed if doc not in seen]
+    if missing:
+        errors.append("нет ответа: " + ", ".join(f"`{doc}`" for doc in missing))
+    return answers, errors
 
 
 def parse_decisions(text: str, count: int, weakening_needed: bool):
@@ -1092,6 +1215,8 @@ class Route:
         if st["checks"]:  # допуск пройден — один раз на маршрут
             st.go(self.after_admission())
             return None
+        if (task := self.step_docs()) is not None:
+            return task
         current = core.head()
         passed = {r["name"]: r for r in (st["admission"] or {}).get("passed", [])}
         listed = admission_checks(core, self.root)
@@ -1105,6 +1230,9 @@ class Route:
                 continue
             if any(core.FILES_ARG.match(a) for a in argv):
                 files = core.branch_files() if files is None else files
+            if name == "tests":
+                fresh.append(self.check_tests(name, argv, files, current))
+                continue
             fresh.append(self.run_check(name, argv, files))
         for r in fresh:
             r["head"] = current  # круги допуска — на разных head: тело PR называет каждый
@@ -1123,6 +1251,62 @@ class Route:
             st.go(self.after_admission())
             return None
         return self.red_checks(red, "Допуск до ревью: красные проверки", RERUN_ADMISSION)
+
+    def step_docs(self):
+        """Задетые документы (#512) — первым делом допуска, до прогона проверок: отбор
+        `affected-tests --docs` по файлам ветки (с удалёнными) и блоку ```affected-docs профиля —
+        один раз на маршрут, список в состоянии (`docs.listed`). По каждому документу сессия
+        отвечает в `.ticket/docs.md`: «обновлено» (документ изменён в ветке) или «не задет:
+        почему». Блока нет — шага нет. None — пройдено, дальше проверки допуска."""
+        core, st = self.core, self.state
+        docs = st["docs"]
+        if docs is None:
+            selector = load_script("affected-tests")
+            try:
+                conf = selector.read_docs_settings(self.root)
+                if conf is None:
+                    st["docs"] = {"configured": False, "listed": [], "answers": {}}
+                    return None
+                changed = self.fix_files(None, deleted=True)  # файлы ветки с удалёнными
+                listed = selector.select_docs(self.root, changed, conf)
+            except selector.SettingsError as exc:
+                return self.stop(f"отбор задетых документов не сделан: {exc}")
+            docs = st["docs"] = {"configured": True, "listed": listed, "answers": None}
+        if docs["answers"] is not None or not docs["listed"]:
+            docs["answers"] = docs["answers"] or {}
+            return None
+        text = core.read_answer(self.root, "docs.md")
+        if not text:
+            return self.docs_task(docs["listed"])
+        changed = set(self.fix_files(None, deleted=True))  # с удалёнными: документ убран
+        answers, errors = parse_docs_answers(text, docs["listed"], changed)
+        if errors:
+            return self.docs_task(docs["listed"], errors)
+        docs["answers"] = answers
+        return None
+
+    def docs_task(self, listed: list[str], errors: list[str] | None = None):
+        parts = []
+        if errors:
+            parts.append("Ответ не принят:\n" + "\n".join(f"- {e}" for e in errors))
+        shown = "\n".join(f"- `{doc}`" for doc in listed)
+        parts.append(DOCS_TASK.format(count=len(listed), listed=shown))
+        return self.turn("Задетые документы до ревью", "\n\n".join(parts))
+
+    def docs_lines(self) -> list[str]:
+        """Итог задетых документов (#512) для тела PR: сколько обновлено, сколько «не задет» и
+        почему. Блока ```affected-docs нет — строки нет."""
+        docs = self.state["docs"] or {}
+        if not docs.get("configured"):
+            return []
+        answers = docs.get("answers") or {}
+        if not docs.get("listed"):
+            return ["- Задетые документы: нет — изменённые файлы ветки не названы ни в одном"]
+        kept = [(doc, said) for doc, (kind, said) in answers.items() if kind == "не задет"]
+        updated = len(answers) - len(kept)
+        lines = [f"- Задетые документы: обновлено {updated}, не задет {len(kept)}"]
+        lines += [f"  - не задет `{doc}`: {said}" for doc, said in kept]
+        return lines
 
     def after_admission(self) -> str:
         """Шаг после допуска: ревью; отчёт ревью этого маршрута уже есть и годен — тесты
@@ -1149,7 +1333,69 @@ class Route:
         task = CHECKS_TASK.format(attempt=attempt, limit=LIMIT, rerun=rerun)
         return self.turn(title, f"{shown}\n\n{task}", long="тесты — до 45 минут")
 
-    def run_check(self, name: str, argv: list[str], files: list[str] | None) -> dict:
+    def check_tests(
+        self, name: str, argv: list[str], files: list[str] | None, current: str
+    ) -> dict:
+        """Строка `tests` допуска и тестов исправлений: после красного прогона — только не
+        зелёные файлы и задетые починкой (`rerun_tests`, #510), иначе — как прочие проверки.
+        Красный прогон, где зелёные файлы узнаны, запоминается (`tests_red`: head, файлы, что идут
+        снова, полный отбор); зелёный или без узнанных — забывается: следующий — весь отбор."""
+        result = self.rerun_tests(name, argv) or self.run_check(name, argv, files)
+        again = result.pop("again", None)
+        red = result["code"] != 0 and again and result.get("selected")
+        self.state["tests_red"] = (
+            {"head": current, "again": again, "selected": result["selected"]} if red else None
+        )
+        return result
+
+    def rerun_tests(self, name: str, argv: list[str]) -> dict | None:
+        """Перегон после красной `tests` (#510; решение 27.10 `2026-10-27-affected-tests-once.md`,
+        п. 3): файлы прошлого прогона, которые он не назвал зелёными (упавшие, не дошедшие до
+        конца), — что остались в дереве, — и тесты, которые общий отбор `affected-tests` даёт по
+        файлам починки: своих коммитов после красного прогона (без коммитов слияния). Зелёные
+        файлы, не задетые починкой, не повторяются. В итоге `selected` — прошлый отбор вместе с
+        перегоном: по нему `ticket wait` ловит промахи. None — перегон весь, как раньше: нет
+        красного прогона с узнанными зелёными, история переписана, починка удалила файл, строка
+        `tests` — не общий отбор `<python> affected-tests {files}` или он не отобрал."""
+        core, red = self.core, self.state["tests_red"]
+        if not red or not red.get("again") or not red.get("selected"):
+            return None
+        if not core.git_ok("merge-base", "--is-ancestor", red["head"], "HEAD"):
+            return None
+        script = canon_selector(argv, core.FILES_ARG)
+        if script is None:
+            return None
+        touched = self.fix_files(red["head"], deleted=True)
+        fixed = [f for f in touched if (self.root / f).is_file()]
+        if len(fixed) != len(touched):
+            return None  # починка удалила файл: отбор по удалённому тестов не найдёт
+        listed: list[str] = []
+        if fixed:
+            # Без `CANON_AFFECTED_OUT`: отбор для перегона не пишется поверх чужого файла отбора
+            # (внешний прогон, в котором идёт маршрут, — например, сцены тестов).
+            env = {k: v for k, v in os.environ.items() if k != core.AFFECTED_OUT}
+            res = core.run(*script, "--list", *fixed, cwd=self.root, env=env)
+            if res.returncode != 0:
+                return None
+            listed = [line for line in res.stdout.splitlines() if line.strip()]
+        again = [t for t in red["again"] if (self.root / t).is_file()]
+        chosen = sorted({*again, *listed})
+        extra = len(set(listed) - set(again))
+        said = f"перегон после починки: не зелёные — {len(again)}, задетые починкой — {extra}"
+        before = red["selected"]
+        kept = {
+            "files": sorted({*before["files"], *fixed}),
+            "tests": sorted({*before["tests"], *chosen}),
+        }
+        if not chosen:
+            return {"name": name, "code": 0, "note": f"{said}; гнать нечего", "selected": kept}
+        python = [*script[:-1], "-I", "-c", RERUN_CODE, str(self.root / script[-1])]
+        result = self.run_check(name, [*python, *chosen], None, {"files": fixed, "tests": chosen})
+        return {**result, "selected": kept, "note": f"код {result['code']}, {said}"}
+
+    def run_check(
+        self, name: str, argv: list[str], files: list[str] | None, chosen: dict | None = None
+    ) -> dict:
         """Одна проверка через `run-log`: `{files}` — `files`; итог с хвостом вывода, строкой
         ошибки и отбором задетых тестов (#464). Проверка, изменившая отслеживаемые файлы рабочей
         копии (форматер в режиме правки), — красная: правка не уходит в ветку молча, как у хука."""
@@ -1170,7 +1416,7 @@ class Route:
         env = {**os.environ, core.AFFECTED_OUT: str(picked)}
         before = self.dirty()
         res = core.run(*argv, cwd=self.root, env=env)
-        selection = selected(picked)
+        selection = selected(picked) if chosen is None else chosen
         log = re.search(r"лог: (\S+)", res.stdout)
         shown = output = res.stdout + res.stderr
         code = res.returncode
@@ -1184,6 +1430,9 @@ class Route:
                 pass
         # Без значений секретов gitleaks (#258): строка ошибки уходит в отчёт на GitHub.
         hide = core.without_secret_fields
+        again = None  # #510: файлы отбора, что идут в перегон, — не названные зелёными
+        if code != 0 and selection and (passed := passed_tests(output, selection["tests"])):
+            again = [t for t in selection["tests"] if t not in passed] or None
         error, leaked = first_error(hide(output)), False
         if name == core.SECRETS and code != 0 and (found := core.secret_findings(output)):
             error, leaked = core.leaks_line(found), True  # файл и строка — без значения
@@ -1195,6 +1444,7 @@ class Route:
             "error": error,
             **({"leaked": True} if leaked else {}),
             **({"selected": selection} if selection is not None else {}),
+            **({"again": again} if again else {}),
         }
 
     # --- тесты исправлений ---
@@ -1224,7 +1474,7 @@ class Route:
             st.go("verify")
             return None
         name, argv = tests[0]
-        result = self.run_check(name, argv, files)
+        result = self.check_tests(name, argv, files, current)
         brief = self.brief(result)
         st["checks_run"] = {"head": current, "results": [brief]}
         if result["code"] == 0:
@@ -1239,7 +1489,7 @@ class Route:
         """Отчёт ревью не годен (код после пропуска «только документы», ветка переписана) —
         ревью заново, и до него — допуск заново: новый код не идёт на платное ревью без него."""
         st = self.state
-        st["checks"] = st["admission"] = st["tested"] = st["retest"] = None
+        st["checks"] = st["admission"] = st["tested"] = st["retest"] = st["tests_red"] = None
         st.go("checks")
         return None
 
@@ -1677,6 +1927,7 @@ class Route:
             lines += [f"- [{'x' if done else ' '}] {item}" for done, item in items] + [""]
         lines += ["## Evidence", ""]
         lines.append(f"- {self.checks_line()}")
+        lines += self.docs_lines()
         if note := core.read_answer(self.root, "checks.md"):
             lines.append(f"- Красное по пути: {note}")
         lines.append(f"- {self.verify_line()}")
@@ -1884,14 +2135,17 @@ class Route:
         st.dir.mkdir(parents=True, exist_ok=True)
         saved.write_text(text, encoding="utf-8")
         where = self.publish_stop(text, saved)
+        # Тикет ждёт владельца — метка триажа «можно брать» неверна (#500); у сессии v2 токен на
+        # чтение: отчёт и метки — у оркестратора.
+        untriaged = "" if core.v2_task() else core.untriage(self.n)
         (self.root / core.ANSWERS / "stop.md").replace(st.dir / f"stop-{core.now()}.md")
         st["stop"]["where"] = where
         st["stop"]["at"] = core.now()
         st.go("stopped", core.OWNER)
         body = (
-            f"Отчёт об остановке — {where}, метка {LABEL}. Передай владельцу одним сообщением: "
-            f"{reason}; вопрос — в отчёте.{self.waive_task()} Ответил «продолжай» — продолжить "
-            "маршрут:"
+            f"Отчёт об остановке — {where}, метка {LABEL}.{untriaged} Передай владельцу одним "
+            f"сообщением: {reason}; вопрос — в отчёте.{self.waive_task()} Ответил «продолжай» — "
+            "продолжить маршрут:"
         )
         return (core.STOPPED, f"Тикет #{self.n}: остановка", body, (f"{self.cmd} --again",))
 

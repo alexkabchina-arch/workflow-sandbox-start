@@ -110,10 +110,15 @@ PROD_COPY_TASK = """
 def enter(plan: dict) -> str:
     """Как войти в worktree плана `session-start`. Что делать, если вход не удался, — всегда: клик
     ждёт и worktree вне `.claude/worktrees/` (`needs_click`), а поведение входа зависит от версии
-    Claude Code (#105, прогон #142)."""
+    Claude Code (#105, прогон #142). Следом — строка подготовки о хуке перед коммитом (`hook`
+    плана, #497): её видит сессия в любой ветке задания старта."""
     wt = plan["worktree"]
+    # Строка подготовки о хуке перед коммитом (#463) — как её печатает `session-start`, с
+    # предупреждением о блоке fast-checks: без неё сессия не видит, что хук стоит (#497).
+    hook = plan.get("hook", "").rstrip(".")
+    hook = f"\n{hook[:1].upper()}{hook[1:]}." if hook else ""
     if plan.get("inside"):  # сессия `session-run` уже запущена в worktree тикета
-        return f"Worktree — {wt} (ветка {plan['branch']}): сессия уже в нём, вход не нужен."
+        return f"Worktree — {wt} (ветка {plan['branch']}): сессия уже в нём, вход не нужен.{hook}"
     line = (
         f"Worktree — {wt} (ветка {plan['branch']}). Перейди в рабочую копию по пути "
         f"{wt} (Claude Code — EnterWorktree с path {wt})"
@@ -123,7 +128,7 @@ def enter(plan: dict) -> str:
     return (
         f"{line}; дальше вся работа и вызовы — из неё. Переход не удался — стоп: владельцу одной "
         "строкой «нужен клик входа в worktree тикета»; без входа маршрут не идёт — `ticket ship` "
-        "работает только из worktree тикета."
+        f"работает только из worktree тикета.{hook}"
     )
 
 
@@ -213,7 +218,21 @@ def own_session(core, n: int) -> dict | None:
         mark = os.environ.get(core.SESSION_MARK)
         if not mark or mark != core.session_mark():
             return None
-    return {"kind": "ticket", "worktree": str(core.toplevel()), "branch": here, "inside": True}
+    worktree = core.toplevel()
+    plan = {"kind": "ticket", "worktree": str(worktree), "branch": here, "inside": True}
+    plan["hook"] = commit_hook(worktree)
+    return plan
+
+
+def commit_hook(worktree: Path) -> str:
+    """Строка о хуке перед коммитом для сессии `session-run` (#497): старт его уже поставил и
+    напечатал строку в терминал, а сессии её не видно — та же подготовка хука (`install`
+    повторный — без вреда) даёт ту же строку для задания."""
+    path = Path(__file__).resolve().parent / "hooks" / "commit_checks.py"  # рядом, без `sys.path`
+    module = types.ModuleType("canon_commit_checks_for_ticket_start")
+    module.__file__ = str(path)
+    exec(compile(path.read_text(encoding="utf-8"), str(path), "exec"), module.__dict__)
+    return module.prepare(worktree)[1]
 
 
 def prepare(core, n: int):
